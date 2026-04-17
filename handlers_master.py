@@ -33,14 +33,7 @@ def escape(text: str) -> str:
 
 
 async def master_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """主Bot /start 命令，支持深度链接"""
-    if context.args:
-        payload = context.args[0]
-        # 格式: newbot/{子bot用户名}?name={显示名称}
-        if payload.startswith('newbot/') or 'newbot_' in payload:
-            await _parse_newbot_deep_link(update, context, payload)
-            return
-
+    """主Bot /start 命令"""
     text = (
         "🤖 <b>FileID Bot 托管平台</b>\n\n"
         "我可以帮你创建属于自己的 FileID Bot！\n"
@@ -52,63 +45,11 @@ async def master_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• /delbot — 删除 Bot\n"
         "• /botstatus — 查看 Bot 运行状态\n\n"
         "💡 <b>使用方法：</b>\n"
-        "1. 使用 /newbot 交互式创建 Bot\n"
+        "1. 使用 /newbot 一键创建 Bot\n"
         "2. 或直接 /addbot 添加已有 Bot\n\n"
         "所有 Bot 共享服务器资源，你无需部署！"
     )
     await update.message.reply_text(text, parse_mode="HTML")
-
-
-async def _parse_newbot_deep_link(update: Update, context: ContextTypes.DEFAULT_TYPE, payload: str) -> None:
-    """解析 newbot 深度链接
-    链接格式: https://t.me/{主Bot用户名}/newbot/{子Bot用户名}/{显示名称}
-    payload 格式: newbot/{子Bot用户名}/{显示名称}
-    """
-    # 去掉 "newbot/" 前缀
-    rest = payload[7:] if payload.startswith('newbot/') else payload[7:]  # 去掉 "newbot/" 或 "newbot_"
-    parts = rest.split('/', 1)
-    bot_username = urllib.parse.unquote(parts[0])
-    bot_name = urllib.parse.unquote(parts[1]) if len(parts) > 1 else bot_username
-
-    if bot_username:
-        await _handle_deep_link_create(update, context, bot_username, bot_name)
-    else:
-        await update.message.reply_text("❌ 链接格式错误，请重新创建。")
-
-
-async def _handle_deep_link_create(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_username: str, bot_name: str) -> None:
-    """处理深度链接：引导用户创建 Bot"""
-    user_id = update.effective_user.id
-
-    from config import MAX_BOTS_PER_USER
-    user_bots = get_user_bots_by_owner(user_id)
-    if len(user_bots) >= MAX_BOTS_PER_USER:
-        existing = user_bots[0]
-        await update.message.reply_text(
-            f"⚠️ 你已有一个 Bot：@{escape(existing['bot_username'])}\n\n"
-            f"请先使用 /delbot 删除后再创建新 Bot。"
-        )
-        return
-
-    botfather_link = f"https://t.me/BotFather?start=/newbot"
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🤖 前往 BotFather 创建 Bot", url=botfather_link)],
-    ])
-
-    text = (
-        f"🤖 <b>创建你的 FileID Bot</b>\n\n"
-        f"Bot 名称：<code>{escape(bot_name)}</code>\n"
-        f"Bot 用户名：<code>@{escape(bot_username)}</code>\n\n"
-        f"📌 <b>操作步骤：</b>\n"
-        f"1. 点击下方按钮前往 BotFather\n"
-        f"2. 设置 Bot 名称为：<code>{escape(bot_name)}</code>\n"
-        f"3. 设置 Bot 用户名为：<code>@{escape(bot_username)}</code>\n"
-        f"4. 获取 Token 后，发送：\n"
-        f"<code>/addbot &lt;Token&gt;</code>"
-    )
-
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 # ==================== /newbot 交互式创建 ====================
@@ -141,7 +82,6 @@ async def new_bot_input_username(update: Update, context: ContextTypes.DEFAULT_T
     """接收 Bot 用户名"""
     username = update.message.text.strip().lstrip('@')
 
-    # 校验用户名格式
     if not username.lower().endswith('bot'):
         await update.message.reply_text(
             "❌ Bot 用户名必须以 <code>bot</code> 结尾，请重新输入。\n\n"
@@ -162,7 +102,7 @@ async def new_bot_input_username(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def new_bot_input_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """接收 Bot 显示名称，生成创建链接"""
+    """接收 Bot 显示名称，生成 BotFather 创建链接"""
     bot_name = update.message.text.strip()
     bot_username = context.user_data.get('new_bot_username', '')
 
@@ -172,30 +112,29 @@ async def new_bot_input_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     master_username = context.bot.username
 
-    # 生成深度链接: https://t.me/{主Bot}/newbot/{子Bot用户名}/{显示名称}
-    encoded_username = urllib.parse.quote(bot_username, safe='')
+    # 生成 BotFather newbot 深度链接
+    # 格式: https://t.me/newbot/{主Bot用户名}/{新Bot用户名}?name={显示名称}
     encoded_name = urllib.parse.quote(bot_name, safe='')
-    deep_link = f"https://t.me/{master_username}/newbot/{encoded_username}/{encoded_name}"
+    create_link = f"https://t.me/newbot/{master_username}/{bot_username}?name={encoded_name}"
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🤖 前往 BotFather 创建 Bot", url="https://t.me/BotFather?start=/newbot")],
+        [InlineKeyboardButton("🤖 一键创建 Bot", url=create_link)],
     ])
 
     text = (
         f"✅ <b>创建信息确认</b>\n\n"
         f"Bot 名称：<code>{escape(bot_name)}</code>\n"
         f"Bot 用户名：<code>@{escape(bot_username)}</code>\n\n"
-        f"📌 <b>创建链接（可分享）：</b>\n"
-        f"<code>{escape(deep_link)}</code>\n\n"
-        f"点击下方按钮前往 BotFather 创建 Bot：\n"
-        f"1. 设置名称为：<code>{escape(bot_name)}</code>\n"
-        f"2. 设置用户名为：<code>@{escape(bot_username)}</code>\n"
-        f"3. 获取 Token 后发送 <code>/addbot &lt;Token&gt;</code>"
+        f"📌 <b>创建链接：</b>\n"
+        f"<code>{escape(create_link)}</code>\n\n"
+        f"点击下方按钮一键创建 Bot：\n"
+        f"BotFather 会自动预填用户名和名称\n\n"
+        f"创建完成后，将 Token 发送：\n"
+        f"<code>/addbot &lt;Token&gt;</code>"
     )
 
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
-    # 清理 user_data
     context.user_data.pop('new_bot_username', None)
     return ConversationHandler.END
 
@@ -271,7 +210,6 @@ async def add_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # 保存到数据库（名字通过 API 获取）
     record_id = add_user_bot(
         owner_id=user_id,
         bot_token=token,
