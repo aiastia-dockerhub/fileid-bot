@@ -90,9 +90,18 @@ def main():
     newbot_conv = ConversationHandler(
         entry_points=[CommandHandler("newbot", new_bot_start)],
         states={
-            INPUT_BOT_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_bot_input_username)],
-            INPUT_BOT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_bot_input_name)],
-            INPUT_BOT_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_bot_input_token)],
+            INPUT_BOT_USERNAME: [
+                CommandHandler("newbot", new_bot_start),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, new_bot_input_username),
+            ],
+            INPUT_BOT_NAME: [
+                CommandHandler("newbot", new_bot_start),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, new_bot_input_name),
+            ],
+            INPUT_BOT_TOKEN: [
+                CommandHandler("newbot", new_bot_start),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, new_bot_input_token),
+            ],
         },
         fallbacks=[CommandHandler("cancel", new_bot_cancel)],
     )

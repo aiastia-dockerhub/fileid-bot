@@ -18,6 +18,49 @@ from database import get_all_active_user_bots
 logger = logging.getLogger(__name__)
 
 
+async def _auto_stop_revoked_bot(bot_username: str, bot_data: dict):
+    """自动停止 Token 被撤销的 Bot，并通知主 Bot 通知用户"""
+    await asyncio.sleep(3)
+
+    bot_record = bot_data.get('bot_record')
+    if not bot_record:
+        return
+
+    owner_id = bot_record.get('owner_id')
+    bot_db_id = bot_record.get('id')
+
+    # 更新数据库状态
+    from database import update_user_bot_status
+    update_user_bot_status(bot_db_id, 'revoked')
+
+    # 通过主 Bot 通知用户
+    try:
+        import __main__
+        bot_manager = getattr(__main__, 'bot_manager', None)
+        if bot_manager:
+            await bot_manager.stop_bot(bot_db_id)
+
+        from config import BOT_TOKEN
+        import httpx
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": owner_id,
+                    "text": (
+                        f"⚠️ <b>Bot 已失效</b>\n\n"
+                        f"🤖 @{bot_username} 的 Token 已被撤销或 Bot 已被删除。\n"
+                        f"系统已自动停止该 Bot。\n\n"
+                        f"如需重新使用，请先 /delbot 删除后重新创建。"
+                    ),
+                    "parse_mode": "HTML"
+                }
+            )
+        logger.info("已通知用户 %s Bot @%s 被撤销", owner_id, bot_username)
+    except Exception as e:
+        logger.error("通知 Bot 撤销失败: %s", e)
+
+
 class BotManager:
     """
     用户Bot管理器
@@ -118,9 +161,18 @@ class BotManager:
         # 回调按钮
         application.add_handler(CallbackQueryHandler(button_callback))
 
-        # 错误处理
+        # 错误处理（含 Token 撤销检测）
         async def user_bot_error_handler(update: object, context):
-            logger.error("用户Bot @%s 错误: %s", context.bot.username, context.error, exc_info=True)
+            error_str = str(context.error)
+            logger.error("用户Bot @%s 错误: %s", context.bot.username, error_str, exc_info=True)
+
+            # 检测 Token 被撤销 / Bot 被删除
+            if "Unauthorized" in error_str or "401" in error_str or "bot was blocked" in error_str.lower():
+                logger.warning("用户Bot @%s Token 已失效，自动停止", context.bot.username)
+                # 延迟停止，避免在错误处理中直接操作
+                import asyncio
+                asyncio.create_task(_auto_stop_revoked_bot(context.bot.username, context.bot_data))
+
             if update and hasattr(update, 'effective_message') and update.effective_message:
                 try:
                     await update.effective_message.reply_text("❌ 处理请求时发生内部错误，请稍后重试。")

@@ -360,6 +360,17 @@ async def add_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """/addbot 添加用户Bot"""
     user_id = update.effective_user.id
 
+    # 检查已有 Bot 数量
+    from config import MAX_BOTS_PER_USER
+    user_bots = get_user_bots_by_owner(user_id)
+    if len(user_bots) >= MAX_BOTS_PER_USER:
+        existing = user_bots[0]
+        await update.message.reply_text(
+            f"⚠️ 你已有一个 Bot：@{escape(existing['bot_username'])}\n\n"
+            f"请先使用 /delbot 删除后再添加新 Bot。"
+        )
+        return
+
     if not context.args:
         await update.message.reply_text(
             "🔑 <b>添加 Bot</b>\n\n"
