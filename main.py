@@ -1,0 +1,105 @@
+"""
+FileID Bot 托管平台 - 主入口
+支持多Bot架构：一个主Bot管理 + 多个用户子Bot
+"""
+import asyncio
+import logging
+import signal
+import sys
+
+from telegram import Update
+from telegram.ext import (
+    Application, ApplicationBuilder, CommandHandler, ContextTypes
+)
+
+from config import BOT_TOKEN, ADMIN_IDS, MAX_BOTS_PER_USER
+from database import init_db
+from bot_manager import BotManager
+
+# ==================== 日志配置 ====================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """主Bot错误处理"""
+    logger.error("主Bot异常: %s", context.error, exc_info=context.error)
+
+
+async def post_init(application: Application) -> None:
+    """主Bot初始化完成后：设置命令、加载所有用户Bot"""
+    # 注册主Bot命令
+    commands = [
+        ("start", "开始使用 / 查看帮助"),
+        ("addbot", "添加你的 Bot"),
+        ("mybots", "查看我的 Bot 列表"),
+        ("delbot", "删除 Bot"),
+        ("botstatus", "查看 Bot 运行状态"),
+        ("platform", "平台统计（管理员）"),
+    ]
+    try:
+        await application.bot.set_my_commands(commands)
+    except Exception as e:
+        logger.warning("主Bot注册命令失败: %s", e)
+
+    # 加载所有用户Bot
+    loaded = await application.bot_data['bot_manager'].load_all()
+    logger.info("✅ 主Bot启动完成，共加载 %d 个用户Bot", loaded)
+
+
+def main():
+    """启动主Bot和所有用户Bot"""
+    if not BOT_TOKEN:
+        logger.error("❌ 未设置 BOT_TOKEN 环境变量")
+        sys.exit(1)
+
+    # 初始化数据库
+    init_db()
+    logger.info("📊 数据库初始化完成")
+
+    # 创建 BotManager
+    bot_manager = BotManager()
+
+    # 构建主Bot Application
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    # 将 BotManager 存入 bot_data 供 handler 使用
+    application.bot_data['bot_manager'] = bot_manager
+
+    # 注册主Bot管理命令
+    from handlers_master import (
+        master_start, add_bot_cmd, my_bots_cmd, delete_bot_cmd,
+        bot_status_cmd, platform_stats_cmd
+    )
+
+    application.add_handler(CommandHandler("start", master_start))
+    application.add_handler(CommandHandler("help", master_start))
+    application.add_handler(CommandHandler("addbot", add_bot_cmd))
+    application.add_handler(CommandHandler("mybots", my_bots_cmd))
+    application.add_handler(CommandHandler("delbot", delete_bot_cmd))
+    application.add_handler(CommandHandler("botstatus", bot_status_cmd))
+    application.add_handler(CommandHandler("platform", platform_stats_cmd))
+    application.add_error_handler(error_handler)
+
+    # 全局引用（供 handlers_master 获取 bot_manager）
+    sys.modules['__main__'].bot_manager = bot_manager
+
+    logger.info("🚀 主Bot @%s 启动中...", "MasterBot")
+    logger.info("📋 每用户最大Bot数: %d", MAX_BOTS_PER_USER)
+
+    # 启动主Bot（会阻塞直到停止）
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == '__main__':
+    main()
