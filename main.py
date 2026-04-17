@@ -81,16 +81,18 @@ def main():
     # 注册主Bot管理命令
     from handlers_master import (
         master_start, add_bot_cmd, new_bot_start, new_bot_input_username,
-        new_bot_input_name, new_bot_cancel, my_bots_cmd, delete_bot_cmd,
-        bot_status_cmd, platform_stats_cmd, INPUT_BOT_USERNAME, INPUT_BOT_NAME
+        new_bot_input_name, new_bot_input_token, new_bot_cancel,
+        my_bots_cmd, delete_bot_cmd, bot_status_cmd, platform_stats_cmd,
+        INPUT_BOT_USERNAME, INPUT_BOT_NAME, INPUT_BOT_TOKEN
     )
 
-    # /newbot 交互式对话
+    # /newbot 交互式对话（3步：用户名 → 名称 → Token）
     newbot_conv = ConversationHandler(
         entry_points=[CommandHandler("newbot", new_bot_start)],
         states={
             INPUT_BOT_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_bot_input_username)],
             INPUT_BOT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_bot_input_name)],
+            INPUT_BOT_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_bot_input_token)],
         },
         fallbacks=[CommandHandler("cancel", new_bot_cancel)],
     )

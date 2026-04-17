@@ -18,7 +18,7 @@ from database import (
 logger = logging.getLogger(__name__)
 
 # Conversation states for /newbot
-INPUT_BOT_USERNAME, INPUT_BOT_NAME = range(2)
+INPUT_BOT_USERNAME, INPUT_BOT_NAME, INPUT_BOT_TOKEN = range(3)
 
 
 def get_bot_manager():
@@ -102,7 +102,7 @@ async def new_bot_input_username(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def new_bot_input_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """接收 Bot 显示名称，生成 BotFather 创建链接"""
+    """接收 Bot 显示名称，生成 BotFather 创建链接，等待 Token"""
     bot_name = update.message.text.strip()
     bot_username = context.user_data.get('new_bot_username', '')
 
@@ -110,10 +110,10 @@ async def new_bot_input_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ 出错了，请重新使用 /newbot 开始。")
         return ConversationHandler.END
 
+    context.user_data['new_bot_name'] = bot_name
     master_username = context.bot.username
 
     # 生成 BotFather newbot 深度链接
-    # 格式: https://t.me/newbot/{主Bot用户名}/{新Bot用户名}?name={显示名称}
     encoded_name = urllib.parse.quote(bot_name, safe='')
     create_link = f"https://t.me/newbot/{master_username}/{bot_username}?name={encoded_name}"
 
@@ -127,21 +127,131 @@ async def new_bot_input_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Bot 用户名：<code>@{escape(bot_username)}</code>\n\n"
         f"📌 <b>创建链接：</b>\n"
         f"<code>{escape(create_link)}</code>\n\n"
-        f"点击下方按钮一键创建 Bot：\n"
-        f"BotFather 会自动预填用户名和名称\n\n"
-        f"创建完成后，将 Token 发送：\n"
-        f"<code>/addbot &lt;Token&gt;</code>"
+        f"👇 <b>下一步：</b>\n"
+        f"1. 点击上方按钮创建 Bot\n"
+        f"2. BotFather 会给你一个 <b>Token</b>\n"
+        f"3. <b>直接把 Token 发到这里</b>，我会自动启动你的 Bot\n\n"
+        f"💡 输入 /cancel 取消操作"
     )
 
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+    return INPUT_BOT_TOKEN
 
+
+async def new_bot_input_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """接收 Token 并自动注册启动 Bot"""
+    token = update.message.text.strip()
+    user_id = update.effective_user.id
+
+    # 检查 Token 格式
+    if ":" not in token or len(token) < 10:
+        await update.message.reply_text(
+            "❌ 这不像是一个有效的 Token，请重新输入。\n\n"
+            "Token 格式类似：<code>123456789:ABCdefGHIjklMNOpqrS</code>",
+            parse_mode="HTML"
+        )
+        return INPUT_BOT_TOKEN
+
+    # 检查 Token 是否已存在
+    existing = get_user_bot_by_token(token)
+    if existing:
+        await update.message.reply_text(
+            f"⚠️ Bot @{escape(existing['bot_username'])} 已经添加过了。"
+        )
+        context.user_data.pop('new_bot_username', None)
+        context.user_data.pop('new_bot_name', None)
+        return ConversationHandler.END
+
+    status_msg = await update.message.reply_text("⏳ 正在校验 Token 并启动 Bot...")
+
+    # 校验 Token
+    from telegram import Bot
+    test_bot = None
+    try:
+        test_bot = Bot(token=token)
+        bot_info = await test_bot.get_me()
+    except Exception as e:
+        await status_msg.edit_text(
+            f"❌ Token 校验失败：{escape(str(e)[:100])}\n\n请重新输入正确的 Token。"
+        )
+        return INPUT_BOT_TOKEN
+    finally:
+        if test_bot:
+            try:
+                await test_bot.shutdown()
+            except Exception:
+                pass
+
+    # 检查 Bot 是否已被添加
+    existing_by_id = get_user_bot_by_telegram_id(bot_info.id)
+    if existing_by_id:
+        await status_msg.edit_text(
+            f"⚠️ Bot @{escape(bot_info.username)} 已被添加（可能是不同 Token）。",
+            parse_mode="HTML"
+        )
+        context.user_data.pop('new_bot_username', None)
+        context.user_data.pop('new_bot_name', None)
+        return ConversationHandler.END
+
+    # 检查用户 Bot 数量
+    from config import MAX_BOTS_PER_USER
+    user_bots = get_user_bots_by_owner(user_id)
+    if len(user_bots) >= MAX_BOTS_PER_USER:
+        await status_msg.edit_text(
+            f"⚠️ 每个用户最多添加 {MAX_BOTS_PER_USER} 个 Bot。\n\n"
+            f"请先使用 /delbot 删除已有 Bot。"
+        )
+        context.user_data.pop('new_bot_username', None)
+        context.user_data.pop('new_bot_name', None)
+        return ConversationHandler.END
+
+    # 保存到数据库
+    record_id = add_user_bot(
+        owner_id=user_id,
+        bot_token=token,
+        bot_id=bot_info.id,
+        bot_username=bot_info.username or "",
+        bot_firstname=bot_info.first_name,
+    )
+
+    if not record_id:
+        await status_msg.edit_text("❌ 添加失败，请重试。")
+        return INPUT_BOT_TOKEN
+
+    # 启动 Bot
+    mgr = get_bot_manager()
+    if mgr:
+        bot_record = get_user_bot_by_id(record_id)
+        success = await mgr.start_bot(bot_record)
+        if success:
+            await status_msg.edit_text(
+                f"✅ <b>Bot 创建成功并已启动！</b>\n\n"
+                f"🤖 名称：{escape(bot_info.first_name)}\n"
+                f"📌 用户名：@{escape(bot_info.username)}\n"
+                f"🆔 Bot ID：<code>{bot_info.id}</code>\n\n"
+                f"现在直接向 @{escape(bot_info.username)} 发送文件即可使用！",
+                parse_mode="HTML"
+            )
+            logger.info("用户 %s 通过 /newbot 创建并启动了 Bot @%s", user_id, bot_info.username)
+        else:
+            await status_msg.edit_text(
+                f"⚠️ Bot 已保存但启动失败，请联系管理员。\n\n"
+                f"🤖 @{escape(bot_info.username)}",
+                parse_mode="HTML"
+            )
+    else:
+        await status_msg.edit_text("❌ BotManager 未初始化，请联系管理员。")
+
+    # 清理
     context.user_data.pop('new_bot_username', None)
+    context.user_data.pop('new_bot_name', None)
     return ConversationHandler.END
 
 
 async def new_bot_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """取消创建"""
     context.user_data.pop('new_bot_username', None)
+    context.user_data.pop('new_bot_name', None)
     await update.message.reply_text("❌ 已取消创建 Bot。")
     return ConversationHandler.END
 
