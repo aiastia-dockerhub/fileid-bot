@@ -3,6 +3,8 @@ import html
 import logging
 import urllib.parse
 
+import httpx
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ContextTypes, ConversationHandler, MessageHandler, filters
@@ -86,16 +88,26 @@ async def handle_managed_bot(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.info("Bot @%s 已存在，跳过", bot_username)
         return
 
-    # 通过 getManagedBotToken 获取 Token
+    # 通过 Telegram 官方 Bot API getManagedBotToken 获取 Token
+    # https://core.telegram.org/bots/api#getmanagedbottoken
+    from config import BOT_TOKEN
+    token = None
     try:
-        token = await context.bot._post(
-            'getManagedBotToken',
-            params={'user_id': bot_id},
-            return_type=str
-        )
-        logger.info("成功获取 managed bot token for @%s", bot_username)
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getManagedBotToken",
+                json={"user_id": bot_id},
+                timeout=30
+            )
+            data = resp.json()
+            if data.get("ok"):
+                token = data.get("result")
+                logger.info("成功获取 managed bot token for @%s", bot_username)
+            else:
+                logger.error("getManagedBotToken API 返回错误: %s", data.get("description"))
+                return
     except Exception as e:
-        logger.error("获取 managed bot token 失败: %s", e)
+        logger.error("调用 getManagedBotToken API 失败: %s", e)
         return
 
     if not token:
