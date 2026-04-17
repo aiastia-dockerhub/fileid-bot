@@ -20,7 +20,7 @@ AUTO_SEND_INTERVAL = 5  # 秒
 GROUP_SEND_SIZE = 10  # 每组最多10个
 CODE_LENGTH = 32  # 随机码长度
 DB_PATH = './data/fileid.db'
-MAX_BOTS_PER_USER = int(os.environ.get('MAX_BOTS_PER_USER', '5'))  # 每个用户最多添加的Bot数
+MAX_BOTS_PER_USER = int(os.environ.get('MAX_BOTS_PER_USER', '1'))  # 每个用户最多添加的Bot数
 
 FILE_TYPE_MAP = {
     'photo': '🖼 图片',

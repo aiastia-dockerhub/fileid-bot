@@ -9,7 +9,8 @@ import sys
 
 from telegram import Update
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, ContextTypes
+    Application, ApplicationBuilder, CommandHandler, ContextTypes,
+    ConversationHandler, MessageHandler, filters
 )
 
 from config import BOT_TOKEN, ADMIN_IDS, MAX_BOTS_PER_USER
@@ -36,6 +37,7 @@ async def post_init(application: Application) -> None:
     # 注册主Bot命令
     commands = [
         ("start", "开始使用 / 查看帮助"),
+        ("newbot", "一键创建你的 Bot"),
         ("addbot", "添加你的 Bot"),
         ("mybots", "查看我的 Bot 列表"),
         ("delbot", "删除 Bot"),
@@ -78,12 +80,24 @@ def main():
 
     # 注册主Bot管理命令
     from handlers_master import (
-        master_start, add_bot_cmd, my_bots_cmd, delete_bot_cmd,
-        bot_status_cmd, platform_stats_cmd
+        master_start, add_bot_cmd, new_bot_start, new_bot_input_username,
+        new_bot_input_name, new_bot_cancel, my_bots_cmd, delete_bot_cmd,
+        bot_status_cmd, platform_stats_cmd, INPUT_BOT_USERNAME, INPUT_BOT_NAME
+    )
+
+    # /newbot 交互式对话
+    newbot_conv = ConversationHandler(
+        entry_points=[CommandHandler("newbot", new_bot_start)],
+        states={
+            INPUT_BOT_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_bot_input_username)],
+            INPUT_BOT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_bot_input_name)],
+        },
+        fallbacks=[CommandHandler("cancel", new_bot_cancel)],
     )
 
     application.add_handler(CommandHandler("start", master_start))
     application.add_handler(CommandHandler("help", master_start))
+    application.add_handler(newbot_conv)
     application.add_handler(CommandHandler("addbot", add_bot_cmd))
     application.add_handler(CommandHandler("mybots", my_bots_cmd))
     application.add_handler(CommandHandler("delbot", delete_bot_cmd))
