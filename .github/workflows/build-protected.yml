@@ -85,13 +85,13 @@ jobs:
           cd ..
 
       - name: Upload Binary Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fileid-bot-linux
           path: fileid-bot-linux.tar.gz
 
       - name: Upload Portable Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fileid-bot-portable
           path: fileid-bot-portable.tar.gz
