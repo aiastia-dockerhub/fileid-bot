@@ -7,6 +7,9 @@ send_batch(bot, chat_id, files, caption) → 发一批文件（≤GROUP_SEND_SIZ
 
 send_file_group(context, chat_id, files, caption) → 向后兼容包装
   - 内部使用 send_queue 提交任务
+
+bot_api_call(send_func, *args, **kwargs) → 全局限速的 API 调用
+  - 所有 Telegram API 调用都应通过此函数，确保 per-bot 限速
 """
 import asyncio
 import logging
@@ -20,10 +23,105 @@ from telegram.error import TimedOut, NetworkError, RetryAfter, BadRequest, Forbi
 from config import (
     GROUP_SEND_SIZE, SEND_RETRY_COUNT, SEND_RETRY_DELAY,
     SEND_INDIVIDUAL_DELAY, RETRY_AFTER_MAX_WAIT,
+    BOT_MIN_API_INTERVAL,
 )
 from db import mark_file_invalid
 
 logger = logging.getLogger(__name__)
+
+
+# ===== Per-Bot 全局 API 限速器 =====
+# 解决核心问题：Handler 中的 query.answer / edit_message / send_message 等调用
+# 不经过发送队列，导致与 send_batch 同时并发，触发 Telegram 429
+
+class _BotRateLimiter:
+    """Per-Bot 的 API 调用限速器（令牌桶模式）
+    
+    - 每个 Bot 独立限速，互不影响
+    - 保证同一个 Bot 的所有 API 调用（包括 handler 中的非文件发送调用）
+      都受到 BOT_MIN_API_INTERVAL 的间隔限制
+    - 使用 asyncio.Lock 保证串行化，避免并发调用叠加
+    """
+    def __init__(self):
+        self._bot_locks: Dict[str, asyncio.Lock] = {}
+        self._bot_last_call: Dict[str, float] = {}
+
+    def _get_lock(self, bot_name: str) -> asyncio.Lock:
+        if bot_name not in self._bot_locks:
+            self._bot_locks[bot_name] = asyncio.Lock()
+        return self._bot_locks[bot_name]
+
+    async def acquire(self, bot_name: str):
+        """获取发送许可，等待最小间隔后返回"""
+        lock = self._get_lock(bot_name)
+        await lock.acquire()
+        try:
+            now = time.monotonic()
+            last = self._bot_last_call.get(bot_name, 0.0)
+            wait = BOT_MIN_API_INTERVAL - (now - last)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._bot_last_call[bot_name] = time.monotonic()
+        except Exception:
+            lock.release()
+            raise
+        return lock
+
+    def release(self, bot_name: str):
+        lock = self._bot_locks.get(bot_name)
+        if lock and lock.locked():
+            lock.release()
+
+    def update_time(self, bot_name: str):
+        """更新 Bot 的最后调用时间（用于 RetryAfter 等待后刷新）"""
+        self._bot_last_call[bot_name] = time.monotonic()
+
+
+# 全局单例
+_rate_limiter = _BotRateLimiter()
+
+
+def _extract_bot_name_from_func(send_func) -> str:
+    """从 send_func 中尝试提取 Bot 用户名，用于限速器标识"""
+    try:
+        bound_self = getattr(send_func, '__self__', None)
+        if bound_self is None:
+            return ''
+        # Bot 对象（如 bot.send_photo）
+        username = getattr(bound_self, 'username', None)
+        if username:
+            return f'@{username}'
+        # Message 对象（如 message.reply_text）→ 通过 get_bot() 获取
+        get_bot = getattr(bound_self, 'get_bot', None)
+        if get_bot:
+            bot = get_bot()
+            username = getattr(bot, 'username', None)
+            if username:
+                return f'@{username}'
+    except Exception:
+        pass
+    return ''
+
+
+async def bot_api_call(send_func, *args, **kwargs):
+    """全局限速的 Telegram API 调用（推荐所有 API 调用都通过此函数）
+
+    用法:
+        # 旧写法（无限速）:
+        await context.bot.send_message(chat_id=chat_id, text="hello")
+
+        # 新写法（限速）:
+        from senders import bot_api_call
+        await bot_api_call(context.bot.send_message, chat_id=chat_id, text="hello")
+
+    对 _retry_send 的包装，增加了 per-bot 全局间隔控制。
+    """
+    bot_name = _extract_bot_name_from_func(send_func)
+    lock = await _rate_limiter.acquire(bot_name)
+    try:
+        return await send_func(*args, **kwargs)
+    finally:
+        _rate_limiter.release(bot_name)
 
 
 def _is_invalid_file_error(e):
@@ -66,8 +164,9 @@ def _extract_bot_name(send_func) -> str:
 
 async def _retry_send(send_func, *args, **kwargs):
     """
-    通用重试包装器：带指数退避的重试机制
-    - RetryAfter（429 Flood）等待指定时间后重试
+    通用重试包装器：带指数退避的重试机制 + per-bot 全局限速
+    - 每次 API 调用前自动等待 BOT_MIN_API_INTERVAL
+    - RetryAfter（429 Flood）等待指定时间后重试，并刷新限速器时间
     - TimedOut / NetworkError 自动重试（指数退避）
     - BadRequest（file_id无效）不重试
     - 最多重试 SEND_RETRY_COUNT 次
@@ -76,7 +175,13 @@ async def _retry_send(send_func, *args, **kwargs):
     last_exception = None
     for attempt in range(SEND_RETRY_COUNT + 1):
         try:
-            return await send_func(*args, **kwargs)
+            # 全局限速：保证同一 Bot 的 API 调用间隔
+            lock = await _rate_limiter.acquire(bot_label)
+            try:
+                result = await send_func(*args, **kwargs)
+            finally:
+                _rate_limiter.release(bot_label)
+            return result
         except BadRequest as e:
             if _is_invalid_file_error(e):
                 logger.warning("文件ID无效，跳过重试: %s", e)
@@ -91,6 +196,8 @@ async def _retry_send(send_func, *args, **kwargs):
             logger.warning("触发限流 (RetryAfter)，等待 %.1f 秒后重试 (第 %d/%d 次) [%s]",
                            wait, attempt + 1, SEND_RETRY_COUNT, bot_label)
             await asyncio.sleep(wait)
+            # RetryAfter 等待后刷新限速器时间，避免等待完立即又触发限流
+            _rate_limiter.update_time(bot_label)
             last_exception = e
         except (TimedOut, NetworkError) as e:
             if attempt < SEND_RETRY_COUNT:

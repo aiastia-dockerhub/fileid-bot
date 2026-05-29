@@ -40,6 +40,11 @@ API_READ_TIMEOUT = float(os.environ.get('API_READ_TIMEOUT', '30.0'))   # Telegra
 API_WRITE_TIMEOUT = float(os.environ.get('API_WRITE_TIMEOUT', '30.0')) # Telegram API 写入超时（秒）
 API_CONNECT_TIMEOUT = float(os.environ.get('API_CONNECT_TIMEOUT', '10.0'))  # Telegram API 连接超时（秒）
 
+# ===== 全局 API 限速配置 =====
+# 每 Bot 所有 API 调用的最小间隔（秒），包括 send_message / edit_message / send_file 等
+# 设为 0.2 秒 → 每 Bot 最大 5 次 API 调用/秒（Telegram 限制约 30 次/秒，留足余量）
+BOT_MIN_API_INTERVAL = float(os.environ.get('BOT_MIN_API_INTERVAL', '0.2'))
+
 # ===== 单机防雪崩配置 =====
 WEBHOOK_UPDATE_TIMEOUT = float(os.environ.get('WEBHOOK_UPDATE_TIMEOUT', '59.0'))  # 单个 webhook 更新最大处理时间（秒），必须 < Telegram 60s 超时，否则会 499
 RETRY_AFTER_MAX_WAIT = float(os.environ.get('RETRY_AFTER_MAX_WAIT', '60.0'))  # 单次 RetryAfter 最大等待秒数，超过则放弃让 Telegram 重试
