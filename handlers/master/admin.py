@@ -75,7 +75,7 @@ async def platform_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     f"   📌 @{escape(bot['bot_username'])}\n"
                     f"   🆔 Bot ID: <code>{bot['bot_id']}</code> | DB ID: <code>{bot['id']}</code>\n"
                     f"   👤 所有者: <a href=\"tg://user?id={bot['owner_id']}\">{bot['owner_id']}</a>\n"
-                    f"   📁 文件: {bot['file_count']} | 📦 集合: {bot['col_count']} | 👥 用户: {bot['user_count']}\n"
+                    f"   📁 文件: {bot['file_count']} | 🆕 今日新文件: {bot.get('today_file_count', 0)} | 📦 集合: {bot['col_count']} | 👥 用户: {bot['user_count']}\n"
                     f"   📅 创建: {bot['created_at']}\n\n"
                 )
 

@@ -71,6 +71,12 @@ async def get_platform_stats() -> Dict:
         )
         active_bots = result.scalar() or 0
 
+        # 活跃 Bot 的 id 集合（用于过滤文件/集合统计，只统计存活 Bot 的）
+        result = await session.execute(
+            select(UserBot.id).where(UserBot.status == 'active')
+        )
+        active_bot_ids = [r[0] for r in result.fetchall()]
+
         # 总用户数（去重 owner_id）
         result = await session.execute(
             select(func.count(func.distinct(UserBot.owner_id))).select_from(UserBot)
@@ -78,17 +84,25 @@ async def get_platform_stats() -> Dict:
         )
         total_users = result.scalar() or 0
 
-        # 总文件数
-        result = await session.execute(
-            select(func.count()).select_from(FileMapping)
-        )
-        total_files = result.scalar() or 0
+        # 总文件数（仅统计存活 Bot 的）
+        if active_bot_ids:
+            result = await session.execute(
+                select(func.count()).select_from(FileMapping)
+                .where(FileMapping.bot_db_id.in_(active_bot_ids))
+            )
+            total_files = result.scalar() or 0
+        else:
+            total_files = 0
 
-        # 总集合数
-        result = await session.execute(
-            select(func.count()).select_from(Collection).where(Collection.status == 'completed')
-        )
-        total_collections = result.scalar() or 0
+        # 总集合数（仅统计存活 Bot 的）
+        if active_bot_ids:
+            result = await session.execute(
+                select(func.count()).select_from(Collection)
+                .where(Collection.bot_db_id.in_(active_bot_ids), Collection.status == 'completed')
+            )
+            total_collections = result.scalar() or 0
+        else:
+            total_collections = 0
 
         return {
             'bot_count': active_bots,
@@ -101,10 +115,13 @@ async def get_platform_stats() -> Dict:
 
 async def get_platform_bot_details(status: str = 'active') -> List[Dict]:
     """获取平台级 Bot 详情列表（含文件数统计）
-    
+
     Args:
         status: 筛选状态，默认 'active'。传 'all' 显示所有非删除的。
     """
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+
     async with get_session() as session:
         if status == 'all':
             query = select(UserBot).where(UserBot.status != 'deleted')
@@ -118,6 +135,7 @@ async def get_platform_bot_details(status: str = 'active') -> List[Dict]:
         details = []
         for bot in bots:
             file_count = 0
+            today_file_count = 0
             col_count = 0
             user_count = 0
             try:
@@ -125,6 +143,14 @@ async def get_platform_bot_details(status: str = 'active') -> List[Dict]:
                     select(func.count()).select_from(FileMapping).where(FileMapping.bot_db_id == bot.id)
                 )
                 file_count = r.scalar() or 0
+            except Exception:
+                pass
+            try:
+                r = await session.execute(
+                    select(func.count()).select_from(FileMapping)
+                    .where(FileMapping.bot_db_id == bot.id, FileMapping.created_at >= today)
+                )
+                today_file_count = r.scalar() or 0
             except Exception:
                 pass
             try:
@@ -154,6 +180,7 @@ async def get_platform_bot_details(status: str = 'active') -> List[Dict]:
                 'status': bot.status,
                 'created_at': bot.created_at or '',
                 'file_count': file_count,
+                'today_file_count': today_file_count,
                 'col_count': col_count,
                 'user_count': user_count,
             })
