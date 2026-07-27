@@ -4,12 +4,19 @@ import time
 from senders import _retry_send
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
-from config import ADMIN_IDS
+from config import ADMIN_IDS, PREMIUM_GIFT_PRICES
 from handlers.master._utils import escape
 
 logger = logging.getLogger(__name__)
+
+
+# Telegram Premium 赠送方案（基础价来自 config.PREMIUM_GIFT_PRICES，单一数据源）
+_PREMIUM_PLANS = [
+    {"months": m, "stars": s} for m, s in sorted(PREMIUM_GIFT_PRICES.items())
+]
 
 
 # ==================== API 辅助函数 ====================
@@ -85,6 +92,9 @@ def _build_stars_main_keyboard():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🎁 发送礼物", callback_data="stars_gift_list|0"),
+            InlineKeyboardButton("💎 赠送 Premium", callback_data="stars_premium_list"),
+        ],
+        [
             InlineKeyboardButton("🔄 刷新", callback_data="stars_refresh"),
         ],
         [
@@ -239,6 +249,52 @@ async def _get_available_gifts(bot, force_refresh=False):
         return gifts
 
 
+async def _get_recent_paying_users(bot, limit=8):
+    """获取近期付费用户列表（礼物 / Premium 赠送选择接收者时共用）"""
+    try:
+        transactions, _ = await _get_star_transactions(bot, limit=50)
+        if not transactions:
+            return []
+        recent = []
+        seen = set()
+        for tx in transactions:
+            if tx.get("amount", 0) > 0:
+                source = tx.get("source", {})
+                if source.get("type") == "user":
+                    uid = source.get("user_id")
+                    if uid and uid not in seen:
+                        seen.add(uid)
+                        recent.append({
+                            "user_id": uid,
+                            "first_name": source.get("first_name", f"用户{uid}"),
+                        })
+                        if len(recent) >= limit:
+                            break
+        return recent
+    except Exception:
+        return []
+
+
+def _build_recipient_keyboard(recent_users, user_cb_prefix, input_cb, back_cb, back_text="⬅️ 返回"):
+    """构建接收者选择键盘（礼物与 Premium 共用）"""
+    keyboard = []
+    if recent_users:
+        row = []
+        for u in recent_users:
+            row.append(InlineKeyboardButton(
+                f"👤 {u['first_name'][:10]}",
+                callback_data=f"{user_cb_prefix}|{u['user_id']}"
+            ))
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("✏️ 手动输入用户 ID", callback_data=input_cb)])
+    keyboard.append([InlineKeyboardButton(back_text, callback_data=back_cb)])
+    return InlineKeyboardMarkup(keyboard)
+
+
 async def stars_gift_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """显示可发送的礼物列表"""
     query = update.callback_query
@@ -330,51 +386,23 @@ async def stars_gift_sel_callback(update: Update, context: ContextTypes.DEFAULT_
     context.user_data['selected_gift_stars'] = star_count
 
     # 获取近期付费用户
-    recent_users = []
-    try:
-        transactions, _ = await _get_star_transactions(context.bot, limit=50)
-        if transactions:
-            seen = set()
-            for tx in transactions:
-                if tx.get("amount", 0) > 0:
-                    source = tx.get("source", {})
-                    if source.get("type") == "user":
-                        uid = source.get("user_id")
-                        if uid and uid not in seen:
-                            seen.add(uid)
-                            recent_users.append({
-                                "user_id": uid,
-                                "first_name": source.get("first_name", f"用户{uid}"),
-                            })
-                            if len(recent_users) >= 8:
-                                break
-    except Exception:
-        pass
+    recent_users = await _get_recent_paying_users(context.bot)
 
     text = (
         f"🎁 <b>已选择礼物：</b>{escape(gift_name)}（{star_count}⭐）\n\n"
         f"请选择接收礼物的用户："
     )
-
-    keyboard = []
     if recent_users:
         text += "\n\n<b>近期付费用户：</b>\n"
-        row = []
-        for u in recent_users:
-            row.append(InlineKeyboardButton(
-                f"👤 {u['first_name'][:10]}",
-                callback_data=f"stars_gift_user|{u['user_id']}"
-            ))
-            if len(row) == 2:
-                keyboard.append(row)
-                row = []
-        if row:
-            keyboard.append(row)
 
-    keyboard.append([InlineKeyboardButton("✏️ 手动输入用户 ID", callback_data="stars_gift_input")])
-    keyboard.append([InlineKeyboardButton("⬅️ 返回礼物列表", callback_data="stars_gift_list|0")])
-
-    await query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = _build_recipient_keyboard(
+        recent_users,
+        user_cb_prefix="stars_gift_user",
+        input_cb="stars_gift_input",
+        back_cb="stars_gift_list|0",
+        back_text="⬅️ 返回礼物列表",
+    )
+    await query.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 async def stars_gift_input_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -391,6 +419,7 @@ async def stars_gift_input_callback(update: Update, context: ContextTypes.DEFAUL
         return
 
     context.user_data['waiting_gift_user_id'] = True
+    context.user_data['gift_flow'] = 'gift'
 
     text = (
         f"🎁 <b>发送礼物：</b>{escape(gift_name)}（{star_count}⭐）\n\n"
@@ -417,7 +446,7 @@ async def stars_gift_user_callback(update: Update, context: ContextTypes.DEFAULT
 
 
 async def _do_send_gift(update, context, target_user_id, query=None):
-    """执行礼物发送"""
+    """执行礼物发送（使用 PTB 原生 bot.send_gift）"""
     gift_id = context.user_data.get('selected_gift_id', '')
     gift_name = context.user_data.get('selected_gift_name', '未知礼物')
     star_count = context.user_data.get('selected_gift_stars', 0)
@@ -435,49 +464,36 @@ async def _do_send_gift(update, context, target_user_id, query=None):
     )
 
     try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"https://api.telegram.org/bot{context.bot.token}/sendGift",
-                json={
-                    "gift_id": gift_id,
-                    "user_id": target_user_id,
-                    "pay_for_upgrade": True,
-                },
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                result = await resp.json()
+        await context.bot.send_gift(
+            gift_id=gift_id,
+            user_id=target_user_id,
+            pay_for_upgrade=True,
+        )
+        text = (
+            f"✅ <b>礼物发送成功！</b>\n\n"
+            f"🎁 <b>礼物：</b>{escape(gift_name)}\n"
+            f"⭐ <b>花费：</b>{star_count} 星星\n"
+            f"👤 <b>接收者 ID：</b><a href=\"tg://user?id={target_user_id}\">{target_user_id}</a>"
+        )
+        logger.info("管理员发送礼物 %s (%d⭐) 给用户 %s", gift_name, star_count, target_user_id)
+    except TelegramError as e:
+        text = (
+            f"❌ <b>礼物发送失败</b>\n\n"
+            f"🎁 {escape(gift_name)} -> 用户 {target_user_id}\n"
+            f"错误：{escape(str(e)[:200])}"
+        )
+        logger.error("发送礼物失败: %s", e)
 
-        if result.get("ok"):
-            text = (
-                f"✅ <b>礼物发送成功！</b>\n\n"
-                f"🎁 <b>礼物：</b>{escape(gift_name)}\n"
-                f"⭐ <b>花费：</b>{star_count} 星星\n"
-                f"👤 <b>接收者 ID：</b><a href=\"tg://user?id={target_user_id}\">{target_user_id}</a>"
-            )
-            logger.info("管理员发送礼物 %s (%d⭐) 给用户 %s", gift_name, star_count, target_user_id)
-        else:
-            error_desc = result.get("description", "未知错误")
-            text = (
-                f"❌ <b>礼物发送失败</b>\n\n"
-                f"🎁 {escape(gift_name)} → 用户 {target_user_id}\n"
-                f"错误：{escape(error_desc)}"
-            )
-            logger.error("发送礼物失败: %s", error_desc)
+    # 清理 user_data（gift_flow 与 waiting_gift_user_id 为礼物/Premium 共用字段）
+    for key in ('selected_gift_id', 'selected_gift_name', 'selected_gift_stars',
+                'waiting_gift_user_id', 'gift_flow'):
+        context.user_data.pop(key, None)
 
-        # 清理 user_data
-        for key in ('selected_gift_id', 'selected_gift_name', 'selected_gift_stars', 'waiting_gift_user_id'):
-            context.user_data.pop(key, None)
-
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🎁 继续发送", callback_data="stars_gift_list|0"),
-            InlineKeyboardButton("⬅️ 返回", callback_data="stars_refresh"),
-        ]])
-        await send_msg.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
-
-    except Exception as e:
-        logger.error("发送礼物异常: %s", e, exc_info=True)
-        await send_msg.edit_text(f"❌ 发送礼物异常：{escape(str(e)[:100])}")
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎁 继续发送", callback_data="stars_gift_list|0"),
+        InlineKeyboardButton("⬅️ 返回", callback_data="stars_refresh"),
+    ]])
+    await send_msg.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 async def stars_gift_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -485,14 +501,15 @@ async def stars_gift_cancel_callback(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     await query.answer("已取消")
 
-    for key in ('selected_gift_id', 'selected_gift_name', 'selected_gift_stars', 'waiting_gift_user_id'):
+    for key in ('selected_gift_id', 'selected_gift_name', 'selected_gift_stars',
+                'waiting_gift_user_id', 'gift_flow'):
         context.user_data.pop(key, None)
 
     await stars_refresh_callback(update, context)
 
 
 async def handle_gift_user_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """处理手动输入的用户 ID（发送礼物用）"""
+    """处理手动输入的用户 ID（礼物 / Premium 赠送共用）"""
     if not context.user_data.get('waiting_gift_user_id'):
         return
 
@@ -508,7 +525,181 @@ async def handle_gift_user_id_input(update: Update, context: ContextTypes.DEFAUL
         return
 
     context.user_data.pop('waiting_gift_user_id', None)
-    await _do_send_gift(update, context, target_user_id)
+    if context.user_data.get('gift_flow') == 'premium':
+        await _do_send_premium(update, context, target_user_id)
+    else:
+        await _do_send_gift(update, context, target_user_id)
+
+
+# ==================== 赠送 Premium 会员 ====================
+
+async def stars_premium_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """显示 Premium 会员赠送方案"""
+    query = update.callback_query
+    await query.answer()
+
+    balance = await _get_bot_star_balance(context.bot)
+    text = (
+        "💎 <b>赠送 Telegram Premium 会员</b>\n\n"
+        "用 Bot 的星星余额为指定用户开通 Premium 会员：\n\n"
+    )
+    if balance is not None:
+        text += f"💰 <b>当前星星余额：</b>{balance:,} ⭐\n\n"
+
+    keyboard = []
+    for plan in _PREMIUM_PLANS:
+        months, stars = plan["months"], plan["stars"]
+        affordable = (balance is None) or (balance >= stars)
+        if affordable:
+            label = f"⏱ {months} 个月  -  {stars}⭐"
+            cb = f"stars_premium_sel|{months}"
+        else:
+            label = f"🚫 {months} 个月  -  {stars}⭐（余额不足）"
+            cb = f"stars_premium_nostars|{months}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=cb)])
+
+    keyboard.append([InlineKeyboardButton("⬅️ 返回星星资产", callback_data="stars_refresh")])
+    await query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def stars_premium_nostars_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """余额不足时的提示"""
+    query = update.callback_query
+    parts = query.data.split("|")
+    months = parts[1] if len(parts) > 1 else "?"
+    await query.answer(f"❌ 星星余额不足，无法赠送 {months} 个月 Premium", show_alert=True)
+
+
+async def stars_premium_sel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """选择 Premium 时长后，选择接收者"""
+    query = update.callback_query
+    parts = query.data.split("|")
+    try:
+        months = int(parts[1]) if len(parts) > 1 else 0
+    except (ValueError, TypeError):
+        months = 0
+    plan = next((p for p in _PREMIUM_PLANS if p["months"] == months), None)
+    if not plan:
+        await query.answer("❌ 方案信息错误", show_alert=True)
+        return
+    await query.answer()
+
+    stars = plan["stars"]
+    context.user_data['selected_premium_months'] = months
+    context.user_data['selected_premium_stars'] = stars
+    context.user_data['gift_flow'] = 'premium'
+
+    recent_users = await _get_recent_paying_users(context.bot)
+    text = (
+        f"💎 <b>赠送 Premium 会员</b>（{months} 个月 / {stars}⭐）\n\n"
+        f"请选择接收者："
+    )
+    if recent_users:
+        text += "\n\n<b>近期付费用户：</b>\n"
+
+    keyboard = _build_recipient_keyboard(
+        recent_users,
+        user_cb_prefix="stars_premium_user",
+        input_cb="stars_premium_input",
+        back_cb="stars_premium_list",
+        back_text="⬅️ 返回方案选择",
+    )
+    await query.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def stars_premium_input_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """手动输入用户 ID 赠送 Premium"""
+    query = update.callback_query
+    await query.answer()
+
+    months = context.user_data.get('selected_premium_months', 0)
+    stars = context.user_data.get('selected_premium_stars', 0)
+    if not months:
+        await query.answer("❌ 请先选择赠送方案", show_alert=True)
+        return
+
+    context.user_data['waiting_gift_user_id'] = True
+    context.user_data['gift_flow'] = 'premium'
+
+    text = (
+        f"💎 <b>赠送 Premium 会员：</b>{months} 个月（{stars}⭐）\n\n"
+        f"请在下方消息中输入接收者的 <b>用户 ID</b>（数字）\n\n"
+        f"💡 提示：可以让用户发送 /start 给主 Bot，从日志中获取其用户 ID。"
+    )
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ 取消", callback_data="stars_premium_cancel")]])
+    await query.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def stars_premium_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """选择用户后赠送 Premium"""
+    query = update.callback_query
+    parts = query.data.split("|")
+    try:
+        target_user_id = int(parts[1]) if len(parts) > 1 else 0
+    except (ValueError, TypeError):
+        target_user_id = 0
+    if not target_user_id:
+        await query.answer("❌ 用户信息错误", show_alert=True)
+        return
+    await query.answer()
+    await _do_send_premium(update, context, target_user_id, query=query)
+
+
+async def _do_send_premium(update, context, target_user_id, query=None):
+    """执行 Premium 会员赠送（使用 PTB 原生 bot.gift_premium_subscription）"""
+    months = context.user_data.get('selected_premium_months', 0)
+    stars = context.user_data.get('selected_premium_stars', 0)
+
+    if not months or not stars:
+        msg = "❌ 请先选择赠送方案"
+        if query:
+            await query.answer(msg, show_alert=True)
+        else:
+            await _retry_send(update.message.reply_text, msg)
+        return
+
+    send_msg = await (query.message if query else update.message).reply_text(
+        f"⏳ 正在赠送 Premium 会员（{months} 个月）给用户 {target_user_id}..."
+    )
+
+    try:
+        await context.bot.gift_premium_subscription(
+            user_id=target_user_id,
+            month_count=months,
+            star_count=stars,
+        )
+        text = (
+            f"✅ <b>Premium 会员赠送成功！</b>\n\n"
+            f"💎 <b>时长：</b>{months} 个月\n"
+            f"⭐ <b>花费：</b>{stars} 星星\n"
+            f"👤 <b>接收者 ID：</b><a href=\"tg://user?id={target_user_id}\">{target_user_id}</a>"
+        )
+        logger.info("管理员赠送 Premium %d 个月 (%d⭐) 给用户 %s", months, stars, target_user_id)
+    except TelegramError as e:
+        text = (
+            f"❌ <b>Premium 赠送失败</b>\n\n"
+            f"💎 {months} 个月 -> 用户 {target_user_id}\n"
+            f"错误：{escape(str(e)[:200])}"
+        )
+        logger.error("赠送 Premium 失败: %s", e)
+
+    for key in ('selected_premium_months', 'selected_premium_stars',
+                'waiting_gift_user_id', 'gift_flow'):
+        context.user_data.pop(key, None)
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💎 继续赠送", callback_data="stars_premium_list"),
+        InlineKeyboardButton("⬅️ 返回", callback_data="stars_refresh"),
+    ]])
+    await send_msg.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def stars_premium_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """取消 Premium 赠送（不单独 answer，交由 list 回调统一 answer，避免双重应答）"""
+    for key in ('selected_premium_months', 'selected_premium_stars',
+                'waiting_gift_user_id', 'gift_flow'):
+        context.user_data.pop(key, None)
+    await stars_premium_list_callback(update, context)
 
 
 # ==================== 回调路由器 ====================
@@ -537,5 +728,17 @@ async def stars_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
         await stars_gift_user_callback(update, context)
     elif data == "stars_gift_cancel":
         await stars_gift_cancel_callback(update, context)
+    elif data == "stars_premium_list":
+        await stars_premium_list_callback(update, context)
+    elif data.startswith("stars_premium_sel|"):
+        await stars_premium_sel_callback(update, context)
+    elif data.startswith("stars_premium_user|"):
+        await stars_premium_user_callback(update, context)
+    elif data.startswith("stars_premium_nostars|"):
+        await stars_premium_nostars_callback(update, context)
+    elif data == "stars_premium_input":
+        await stars_premium_input_callback(update, context)
+    elif data == "stars_premium_cancel":
+        await stars_premium_cancel_callback(update, context)
     else:
         await query.answer("未知操作", show_alert=True)

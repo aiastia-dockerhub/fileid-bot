@@ -299,7 +299,9 @@ def _register_master_handlers(application: Application):
     application.add_handler(CommandHandler("vip", vip_command))
     application.add_handler(CallbackQueryHandler(vip_callback_router, pattern=r'^(buy_vip|vip_history)'))
     application.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
-    application.add_handler(TypeHandler(Update, _payment_filter_handler), group=10)
+    # block=False: 否则该 TypeHandler 会吞掉 group 10 中所有后续 MessageHandler,
+    # 导致「手动输入用户 ID 发送礼物」的文本永远到不了 handle_gift_user_id_input
+    application.add_handler(TypeHandler(Update, _payment_filter_handler, block=False), group=10)
 
     # 管理员星星资产管理 / 礼物发送
     from handlers.master.gifts import (
@@ -309,6 +311,11 @@ def _register_master_handlers(application: Application):
     application.add_handler(CallbackQueryHandler(stars_callback_router, pattern=r'^stars_'))
     # 处理管理员手动输入用户 ID 发送礼物（放在较低优先级组）
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_gift_user_id_input), group=10)
+
+    # 用户购买 Telegram Premium 会员（星星支付，Bot 赠送官方 Premium）
+    from handlers.master.premium import premium_command, buy_premium_callback
+    application.add_handler(CommandHandler("premium", premium_command))
+    application.add_handler(CallbackQueryHandler(buy_premium_callback, pattern=r'^buy_premium\|'))
 
     application.add_error_handler(error_handler)
 

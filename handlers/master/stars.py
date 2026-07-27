@@ -7,7 +7,7 @@ from senders import _retry_send
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import ContextTypes
 
-from config import VIP_PLANS, VIP_EXPIRE_NOTICE_DAYS
+from config import VIP_PLANS, VIP_EXPIRE_NOTICE_DAYS, PREMIUM_GIFT_PRICES, PREMIUM_USER_MARKUP
 from db.vip import (
     get_user_vip_info, get_user_vip_level, get_max_bots_for_user,
     update_user_vip, record_star_payment, get_payment_history,
@@ -204,32 +204,64 @@ async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     payload = query.invoice_payload
     parts = payload.split("_")
 
-    if len(parts) < 4 or parts[0] != "vip":
+    if not parts:
         await query.answer(ok=False, error_message="无效的支付信息")
         return
 
-    try:
-        level = int(parts[1])
-        months = int(parts[2])
-        user_id = int(parts[3])
-    except (ValueError, IndexError):
+    flow = parts[0]
+
+    if flow == "vip":
+        # vip_{level}_{months}_{user_id}_{ts}
+        if len(parts) < 4:
+            await query.answer(ok=False, error_message="无效的支付信息")
+            return
+        try:
+            level = int(parts[1])
+            months = int(parts[2])
+            user_id = int(parts[3])
+        except (ValueError, IndexError):
+            await query.answer(ok=False, error_message="无效的支付信息")
+            return
+
+        # 验证计划是否存在
+        plan = VIP_PLANS.get(level)
+        if not plan:
+            await query.answer(ok=False, error_message="无效的VIP等级")
+            return
+
+        # 验证价格
+        expected_price = plan['yearly_price'] if months == 12 else plan['monthly_price']
+        if query.total_amount != expected_price:
+            await query.answer(ok=False, error_message="价格不匹配，请重新发起支付")
+            return
+
+        # 验证通过
+        await query.answer(ok=True)
+
+    elif flow == "premium":
+        # premium_{months}_{user_id}_{ts}
+        if len(parts) < 4:
+            await query.answer(ok=False, error_message="无效的支付信息")
+            return
+        try:
+            months = int(parts[1])
+        except (ValueError, IndexError):
+            await query.answer(ok=False, error_message="无效的支付信息")
+            return
+
+        if months not in PREMIUM_GIFT_PRICES:
+            await query.answer(ok=False, error_message="无效的方案")
+            return
+
+        expected_price = PREMIUM_GIFT_PRICES[months] + PREMIUM_USER_MARKUP
+        if query.total_amount != expected_price:
+            await query.answer(ok=False, error_message="价格不匹配，请重新发起支付")
+            return
+
+        await query.answer(ok=True)
+
+    else:
         await query.answer(ok=False, error_message="无效的支付信息")
-        return
-
-    # 验证计划是否存在
-    plan = VIP_PLANS.get(level)
-    if not plan:
-        await query.answer(ok=False, error_message="无效的VIP等级")
-        return
-
-    # 验证价格
-    expected_price = plan['yearly_price'] if months == 12 else plan['monthly_price']
-    if query.total_amount != expected_price:
-        await query.answer(ok=False, error_message="价格不匹配，请重新发起支付")
-        return
-
-    # 验证通过
-    await query.answer(ok=True)
 
 
 # ==================== 支付验证 ====================
@@ -284,7 +316,17 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
     payload = payment.invoice_payload
     parts = payload.split("_")
 
-    if len(parts) < 4 or parts[0] != "vip":
+    if not parts:
+        logger.warning("收到未知 payload 的支付成功: %s", payload)
+        return
+
+    # Premium 购买走独立处理器（延迟导入避免循环依赖）
+    if parts[0] == "premium":
+        from handlers.master.premium import handle_premium_payment_success
+        await handle_premium_payment_success(update, context)
+        return
+
+    if parts[0] != "vip" or len(parts) < 4:
         logger.warning("收到未知 payload 的支付成功: %s", payload)
         return
 
