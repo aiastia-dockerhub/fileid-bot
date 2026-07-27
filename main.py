@@ -196,12 +196,10 @@ def run_worker():
 
 
 # ==================== 通用函数 ====================
-
-async def _payment_filter_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """过滤并处理 successful_payment 类型的 Update"""
-    if update.message and update.message.successful_payment:
-        from handlers.master.stars import successful_payment_handler
-        await successful_payment_handler(update, context)
+# 原本用 TypeHandler(Update, _payment_filter_handler) 捕获 successful_payment，
+# 但 TypeHandler 匹配所有 Update，按 PTB「同组只跑第一个匹配 handler」的规则，
+# 会吞掉同组后续 MessageHandler（如「手动输入用户 ID 发送礼物」），导致输入无响应。
+# 改用 MessageHandler(filters.SUCCESSFUL_PAYMENT, ...) 专用 handler，只匹配支付成功消息。
 
 
 def _start_vip_expire_job(application: Application):
@@ -299,9 +297,9 @@ def _register_master_handlers(application: Application):
     application.add_handler(CommandHandler("vip", vip_command))
     application.add_handler(CallbackQueryHandler(vip_callback_router, pattern=r'^(buy_vip|vip_history)'))
     application.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
-    # block=False: 否则该 TypeHandler 会吞掉 group 10 中所有后续 MessageHandler,
-    # 导致「手动输入用户 ID 发送礼物」的文本永远到不了 handle_gift_user_id_input
-    application.add_handler(TypeHandler(Update, _payment_filter_handler, block=False), group=10)
+    # 支付成功消息：用专用 filter，避免 TypeHandler(Update) 吞掉普通文本 handler。
+    # 内部按 payload 前缀分流 vip_ / premium_。
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
     # 管理员星星资产管理 / 礼物发送
     from handlers.master.gifts import (
@@ -309,7 +307,9 @@ def _register_master_handlers(application: Application):
     )
     application.add_handler(CommandHandler("mystars", mystars_command))
     application.add_handler(CallbackQueryHandler(stars_callback_router, pattern=r'^stars_'))
-    # 处理管理员手动输入用户 ID 发送礼物（放在较低优先级组）
+    # 处理管理员手动输入用户 ID 发送礼物。
+    # 放在 group 10（独立分组）：主 Bot 无其他普通文本 handler，这里也不会干扰 group 0 的命令/回调。
+    # 内部有 `if not waiting_gift_user_id: return` 守卫，仅在「手动输入」流程激活时处理。
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_gift_user_id_input), group=10)
 
     # 用户购买 Telegram Premium 会员（星星支付，Bot 赠送官方 Premium）
