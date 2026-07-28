@@ -379,11 +379,14 @@ async def stars_gift_sel_callback(update: Update, context: ContextTypes.DEFAULT_
     sticker = gift_info.get("sticker", {})
     gift_name = f"{sticker.get('emoji', '🎁')} Gift #{gift_id}"
     star_count = gift_info.get("star_count", 0)
+    # 是否支持升级为 unique：Gift 对象有 upgrade_star_count 字段才可升级
+    upgradeable = "upgrade_star_count" in gift_info
 
     # 存储到 user_data
     context.user_data['selected_gift_id'] = gift_id
     context.user_data['selected_gift_name'] = gift_name
     context.user_data['selected_gift_stars'] = star_count
+    context.user_data['selected_gift_upgradeable'] = upgradeable
 
     # 获取近期付费用户
     recent_users = await _get_recent_paying_users(context.bot)
@@ -450,6 +453,7 @@ async def _do_send_gift(update, context, target_user_id, query=None):
     gift_id = context.user_data.get('selected_gift_id', '')
     gift_name = context.user_data.get('selected_gift_name', '未知礼物')
     star_count = context.user_data.get('selected_gift_stars', 0)
+    upgradeable = context.user_data.get('selected_gift_upgradeable', False)
 
     if not gift_id:
         msg = "❌ 请先选择礼物"
@@ -463,19 +467,23 @@ async def _do_send_gift(update, context, target_user_id, query=None):
         f"⏳ 正在发送礼物 {escape(gift_name)} 给用户 {target_user_id}..."
     )
 
+    # 仅当礼物支持升级为 unique 时才传 pay_for_upgrade=True，
+    # 否则 Telegram 会报 STARGIFT_UPGRADE_UNAVAILABLE。
+    send_kwargs = {"gift_id": gift_id, "user_id": target_user_id}
+    if upgradeable:
+        send_kwargs["pay_for_upgrade"] = True
+
     try:
-        await context.bot.send_gift(
-            gift_id=gift_id,
-            user_id=target_user_id,
-            pay_for_upgrade=True,
-        )
+        await context.bot.send_gift(**send_kwargs)
         text = (
             f"✅ <b>礼物发送成功！</b>\n\n"
             f"🎁 <b>礼物：</b>{escape(gift_name)}\n"
-            f"⭐ <b>花费：</b>{star_count} 星星\n"
-            f"👤 <b>接收者 ID：</b><a href=\"tg://user?id={target_user_id}\">{target_user_id}</a>"
+            f"⭐ <b>花费：</b>{star_count} 星星"
+            + ("（已含升级为 unique 的费用）" if upgradeable else "")
+            + f"\n👤 <b>接收者 ID：</b><a href=\"tg://user?id={target_user_id}\">{target_user_id}</a>"
         )
-        logger.info("管理员发送礼物 %s (%d⭐) 给用户 %s", gift_name, star_count, target_user_id)
+        logger.info("管理员发送礼物 %s (%d⭐, upgrade=%s) 给用户 %s",
+                    gift_name, star_count, upgradeable, target_user_id)
     except TelegramError as e:
         text = (
             f"❌ <b>礼物发送失败</b>\n\n"
@@ -486,7 +494,7 @@ async def _do_send_gift(update, context, target_user_id, query=None):
 
     # 清理 user_data（gift_flow 与 waiting_gift_user_id 为礼物/Premium 共用字段）
     for key in ('selected_gift_id', 'selected_gift_name', 'selected_gift_stars',
-                'waiting_gift_user_id', 'gift_flow'):
+                'selected_gift_upgradeable', 'waiting_gift_user_id', 'gift_flow'):
         context.user_data.pop(key, None)
 
     keyboard = InlineKeyboardMarkup([[
@@ -502,7 +510,7 @@ async def stars_gift_cancel_callback(update: Update, context: ContextTypes.DEFAU
     await query.answer("已取消")
 
     for key in ('selected_gift_id', 'selected_gift_name', 'selected_gift_stars',
-                'waiting_gift_user_id', 'gift_flow'):
+                'selected_gift_upgradeable', 'waiting_gift_user_id', 'gift_flow'):
         context.user_data.pop(key, None)
 
     await stars_refresh_callback(update, context)
