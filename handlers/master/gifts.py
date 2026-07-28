@@ -405,7 +405,12 @@ async def stars_gift_sel_callback(update: Update, context: ContextTypes.DEFAULT_
         back_cb="stars_gift_list|0",
         back_text="⬅️ 返回礼物列表",
     )
-    await query.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    # 在「手动输入」和「返回」之间插入一行：生成领取链接
+    rows = keyboard.inline_keyboard
+    link_row = [InlineKeyboardButton("🔗 生成领取链接", callback_data="stars_gift_link")]
+    # 插在倒数第二行（返回按钮之前）
+    rows.insert(-1, link_row)
+    await query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def stars_gift_input_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -710,6 +715,153 @@ async def stars_premium_cancel_callback(update: Update, context: ContextTypes.DE
     await stars_premium_list_callback(update, context)
 
 
+# ==================== 礼物领取链接（一码一人） ====================
+
+async def stars_gift_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """管理员：为当前选中的礼物生成一个一次性领取链接"""
+    query = update.callback_query
+    await query.answer()
+
+    gift_id = context.user_data.get('selected_gift_id', '')
+    gift_name = context.user_data.get('selected_gift_name', '未知礼物')
+    star_count = context.user_data.get('selected_gift_stars', 0)
+    upgradeable = context.user_data.get('selected_gift_upgradeable', False)
+
+    if not gift_id:
+        await query.answer("❌ 请先选择礼物", show_alert=True)
+        return
+
+    # 星星余额预检：避免生成后无人能领（Bot 没钱发）
+    balance = await _get_bot_star_balance(context.bot)
+    if balance is not None and balance < star_count:
+        await query.edit_message_text(
+            f"❌ <b>余额不足，无法生成领取码</b>\n\n"
+            f"🎁 礼物价格：{star_count}⭐\n"
+            f"💰 当前余额：{balance}⭐\n\n"
+            f"请先充值 Bot 星星余额。",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ 返回", callback_data="stars_gift_list|0"),
+            ]]),
+        )
+        return
+
+    # 生成领取码
+    from db.gifts import create_claim
+    claim = await create_claim(
+        gift_id=gift_id,
+        gift_name=gift_name,
+        star_count=star_count,
+        upgradeable=upgradeable,
+        created_by=update.effective_user.id,
+    )
+    if not claim:
+        await query.message.reply_text("❌ 生成领取码失败，请重试。")
+        return
+
+    # 拼接 t.me 链接：用主 Bot 用户名（领取在主 Bot 完成）
+    bot_username = context.bot.username
+    link = f"https://t.me/{bot_username}?start={claim['code']}"
+
+    text = (
+        f"🔗 <b>礼物领取链接已生成</b>\n\n"
+        f"🎁 <b>礼物：</b>{escape(gift_name)}（{star_count}⭐）\n"
+        f"📋 <b>状态：</b>待领取（一码一人，先到先得）\n\n"
+        f"<b>领取链接：</b>\n<code>{link}</code>\n\n"
+        f"💡 任何人点此链接打开本 Bot 即可领取，领完后链接自动失效。"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 再生成一个", callback_data="stars_gift_link")],
+        [InlineKeyboardButton("⬅️ 返回礼物列表", callback_data="stars_gift_list|0")],
+    ])
+    await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def handle_gift_claim(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str) -> None:
+    """处理 /start claim_xxx：任意用户点击领取链接后的领取流程。
+
+    流程：查码 → 原子认领（行锁防并发）→ 真正发礼物 → 失败则回滚状态。
+    """
+    user_id = update.effective_user.id
+    from db.gifts import get_claim, try_claim
+
+    # 1. 查码是否存在
+    claim = await get_claim(code)
+    if not claim:
+        await _retry_send(update.message.reply_text,
+            "❌ <b>领取链接无效</b>\n\n这个领取码不存在，可能链接已损坏。",
+            parse_mode="HTML")
+        return
+
+    # 2. 已领取 → 提示来晚了
+    if claim['status'] == 'claimed':
+        claimed_by = claim.get('claimant_user_id')
+        is_self = (claimed_by == user_id)
+        if is_self:
+            text = (
+                f"ℹ️ <b>你已经领取过这个礼物了</b>\n\n"
+                f"🎁 {escape(claim['gift_name'])}\n"
+                f"领取时间：{claim.get('claimed_at', '未知')}"
+            )
+        else:
+            text = "❌ <b>这个礼物已被领取</b>\n\n你来晚了一步，链接已失效。"
+        await _retry_send(update.message.reply_text, text, parse_mode="HTML")
+        return
+
+    # 3. 状态异常（如已过期）
+    if claim['status'] != 'pending':
+        await _retry_send(update.message.reply_text,
+            "❌ <b>这个领取链接已失效</b>", parse_mode="HTML")
+        return
+
+    # 4. 原子认领（行锁防并发，try_claim 内部保证 status=pending 才认领）
+    claimed = await try_claim(code, user_id)
+    if not claimed:
+        # 并发竞争：被人抢先一步
+        await _retry_send(update.message.reply_text,
+            "❌ <b>手慢了！</b>\n\n这个礼物刚被别人领走，下次早点哦。",
+            parse_mode="HTML")
+        return
+
+    # 5. 认领成功 → 真正发送礼物
+    gift_id = claimed['gift_id']
+    gift_name = claimed['gift_name']
+    star_count = claimed['star_count']
+    upgradeable = bool(claimed.get('upgradeable', 0))
+
+    send_kwargs = {"gift_id": gift_id, "user_id": user_id}
+    if upgradeable:
+        send_kwargs["pay_for_upgrade"] = True
+
+    try:
+        await context.bot.send_gift(**send_kwargs)
+        logger.info("领取码 %s 发货成功：礼物 %s 给用户 %s", code, gift_name, user_id)
+        await _retry_send(update.message.reply_text,
+            f"🎉 <b>礼物领取成功！</b>\n\n"
+            f"🎁 <b>礼物：</b>{escape(gift_name)}\n"
+            f"⭐ <b>价值：</b>{star_count} 星星\n\n"
+            f"已发放到你的账户，可在 Telegram 个人主页 → 礼物中查看。",
+            parse_mode="HTML")
+    except TelegramError as e:
+        # 发货失败：回滚状态为 pending，让别人还能领（或管理员处理）
+        from db.gifts import GiftClaim
+        from db.core import get_session
+        from sqlalchemy import update as sa_update
+        async with get_session() as session:
+            await session.execute(
+                sa_update(GiftClaim)
+                .where(GiftClaim.code == code)
+                .values(status='pending', claimant_user_id=None, claimed_at=None)
+            )
+            await session.commit()
+        logger.error("领取码 %s 发货失败（已回滚）: %s", code, e)
+        await _retry_send(update.message.reply_text,
+            f"❌ <b>礼物领取失败</b>\n\n"
+            f"错误：{escape(str(e)[:150])}\n\n"
+            f"领取码已退回，可稍后重试或联系管理员。",
+            parse_mode="HTML")
+
+
 # ==================== 回调路由器 ====================
 
 async def stars_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -732,6 +884,8 @@ async def stars_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
         await stars_gift_sel_callback(update, context)
     elif data == "stars_gift_input":
         await stars_gift_input_callback(update, context)
+    elif data == "stars_gift_link":
+        await stars_gift_link_callback(update, context)
     elif data.startswith("stars_gift_user|"):
         await stars_gift_user_callback(update, context)
     elif data == "stars_gift_cancel":

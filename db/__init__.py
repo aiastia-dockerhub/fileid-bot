@@ -43,3 +43,6 @@ from db.vip import (  # noqa: F401
     get_user_forward_protect, set_user_forward_protect,
     should_protect_content,
 )
+from db.gifts import (  # noqa: F401
+    create_claim, get_claim, try_claim, list_claims, get_pending_claims_count,
+)

@@ -123,6 +123,25 @@ class UserBotPref(Base):
     forward_protect: Mapped[int] = mapped_column(Integer, default=0)  # 0=不保护(允许转发), 1=保护(禁止转发)
 
 
+class GiftClaim(Base):
+    """礼物领取码（一码一人，先到先得）"""
+    __tablename__ = 'gift_claims'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # 领取码（URL 友好，唯一），如 claim_abc123xyz
+    code: Mapped[str] = mapped_column(String, unique=True, nullable=False, index=True)
+    gift_id: Mapped[str] = mapped_column(String, nullable=False)
+    gift_name: Mapped[str] = mapped_column(String, nullable=False)
+    star_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    upgradeable: Mapped[int] = mapped_column(Integer, default=0)  # 0=不可升级, 1=可升级
+    # 状态：pending=待领取, claimed=已领取, expired=已失效
+    status: Mapped[str] = mapped_column(String, default='pending')
+    created_by: Mapped[int] = mapped_column(Integer, nullable=False)  # 生成者(管理员) user_id
+    claimant_user_id: Mapped[int] = mapped_column(Integer, nullable=True)  # 领取者 user_id
+    created_at: Mapped[str] = mapped_column(String, nullable=True)
+    claimed_at: Mapped[str] = mapped_column(String, nullable=True)
+
+
 class WorkerNode(Base):
     """Worker 节点"""
     __tablename__ = 'worker_nodes'

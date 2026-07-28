@@ -20,6 +20,14 @@ logger = logging.getLogger(__name__)
 
 async def master_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """主Bot /start 命令"""
+    # Deep-link 处理：/start claim_xxx → 礼物领取
+    if context.args:
+        arg = context.args[0].strip()
+        if arg.startswith("claim_"):
+            from handlers.master.gifts import handle_gift_claim
+            await handle_gift_claim(update, context, arg)
+            return
+
     text = (
         "🤖 <b>FileID Bot 托管平台</b>\n\n"
         "我可以帮你创建属于自己的 FileID Bot！\n"
