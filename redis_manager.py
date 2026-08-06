@@ -33,6 +33,11 @@ class RedisManager:
         self._memory_cache: Dict[str, tuple] = {}  # key -> (value, expire_at)
         self._rate_windows: Dict[str, list] = {}  # key -> [timestamp, ...]
         self._counters: Dict[str, int] = {}
+        # 内存降级模式下的惰性清理：每 _GC_INTERVAL 次写操作做一次过期扫描
+        self._op_count = 0
+        self._last_gc = 0.0
+        self._GC_INTERVAL = 2000
+        self._GC_MAX_AGE = 7200  # 计数器/限流窗口超过 2 小时未访问即回收
 
     async def init(self):
         """初始化 Redis 连接"""
@@ -71,6 +76,35 @@ class RedisManager:
     def available(self) -> bool:
         return self._available
 
+    def _maybe_gc(self):
+        """内存降级模式下的惰性 GC：清理过期缓存和长期未访问的限流/计数器 key
+
+        仅在内存模式生效，Redis 模式下由 Redis 自身处理过期。
+        - _memory_cache：删除已过期项
+        - _rate_windows：删除空窗口和超过 _GC_MAX_AGE 未访问的 key
+        - _counters：删除超过 _GC_MAX_AGE 未访问的 key（需记录访问时间）
+        """
+        now = time.time()
+        if now - self._last_gc < self._GC_INTERVAL / 10:
+            # 距上次 GC 太近，跳过（基于调用频率估算的最小间隔）
+            return
+        self._last_gc = now
+
+        # 清理过期缓存
+        if self._memory_cache:
+            expired = [k for k, (_, exp) in self._memory_cache.items() if exp and now > exp]
+            for k in expired:
+                del self._memory_cache[k]
+
+        # 清理空/陈旧的限流窗口
+        if self._rate_windows:
+            stale = [k for k, ts in self._rate_windows.items() if not ts or (ts and now - ts[-1] > self._GC_MAX_AGE)]
+            for k in stale:
+                del self._rate_windows[k]
+
+        # 计数器：只清理带 TTL 标记且已过期的（counter_incr 不记录访问时间，
+        # 因此对 _counters 不做激进回收，避免清掉仍有业务意义的统计值）
+
     # ==================== 缓存 ====================
 
     async def cache_get(self, key: str) -> Optional[str]:
@@ -101,6 +135,7 @@ class RedisManager:
                 logger.warning("Redis cache_set 失败: %s", e)
         else:
             self._memory_cache[key] = (value, time.time() + ttl)
+            self._maybe_gc()
 
     async def cache_delete(self, key: str):
         """删除缓存"""
@@ -176,6 +211,7 @@ class RedisManager:
             if current > limit:
                 wait = timestamps[0] + window - now
                 return False, current, max(0, wait)
+            self._maybe_gc()
             return True, current, 0
 
     async def rate_limit_wait(self, key: str, limit: int, window: int, max_wait: float = 30.0) -> bool:

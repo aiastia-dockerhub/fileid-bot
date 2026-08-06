@@ -81,8 +81,11 @@ class _BotRateLimiter:
 _rate_limiter = _BotRateLimiter()
 
 
-def _extract_bot_name_from_func(send_func) -> str:
-    """从 send_func 中尝试提取 Bot 用户名，用于限速器标识"""
+def _extract_bot_name(send_func) -> str:
+    """从 send_func 中尝试提取 Bot 用户名（用于限速器标识和日志）
+
+    同时被 bot_api_call 和 _retry_send 复用，避免两份重复实现。
+    """
     try:
         bound_self = getattr(send_func, '__self__', None)
         if bound_self is None:
@@ -116,7 +119,7 @@ async def bot_api_call(send_func, *args, **kwargs):
 
     对 _retry_send 的包装，增加了 per-bot 全局间隔控制。
     """
-    bot_name = _extract_bot_name_from_func(send_func)
+    bot_name = _extract_bot_name(send_func)
     lock = await _rate_limiter.acquire(bot_name)
     try:
         return await send_func(*args, **kwargs)
@@ -138,28 +141,6 @@ def _is_blocked_error(e):
 class SendBlockedError(Exception):
     """用户已拉黑 Bot，发送应立即中止"""
     pass
-
-
-def _extract_bot_name(send_func) -> str:
-    """从 send_func 中尝试提取 Bot 用户名，用于日志标识"""
-    try:
-        bound_self = getattr(send_func, '__self__', None)
-        if bound_self is None:
-            return ''
-        # Bot 对象（如 bot.send_photo）
-        username = getattr(bound_self, 'username', None)
-        if username:
-            return f'@{username}'
-        # Message 对象（如 message.reply_text）→ 通过 get_bot() 获取
-        get_bot = getattr(bound_self, 'get_bot', None)
-        if get_bot:
-            bot = get_bot()
-            username = getattr(bot, 'username', None)
-            if username:
-                return f'@{username}'
-    except Exception:
-        pass
-    return ''
 
 
 async def _retry_send(send_func, *args, **kwargs):
@@ -217,32 +198,57 @@ async def _retry_send(send_func, *args, **kwargs):
 # ===== 核心：发送一批文件（被队列消费者调用） =====
 
 async def _schedule_auto_delete(bot, chat_id: int, message_ids: list, delay: int):
-    """延迟删除消息（静默失败，带限流保护）"""
+    """延迟删除消息（静默失败，带限流保护）
+
+    优化：用 Semaphore 控制并发（默认 3），替代原来"每条删完 sleep 0.3s"的纯串行写法，
+    在消息数量较多时显著缩短总耗时，同时仍保留 RetryAfter 处理避免限流雪崩。
+    """
     try:
         await asyncio.sleep(delay)
-        deleted = 0
-        for msg_id in message_ids:
+        if not message_ids:
+            return
+
+        # 少量消息直接串行，避免并发开销；较多消息走有限并发
+        if len(message_ids) <= 3:
+            sem = None
+            concurrency = 1
+        else:
+            concurrency = 3
+            sem = asyncio.Semaphore(concurrency)
+
+        deleted_box = [0]  # 用 list 包装以便内部协程累加
+
+        async def _delete_one(msg_id):
             try:
-                await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                deleted += 1
-                # 批量删除时加小延迟，避免触发限流
-                if len(message_ids) > 5:
-                    await asyncio.sleep(0.3)
+                if sem:
+                    async with sem:
+                        await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                else:
+                    await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                deleted_box[0] += 1
             except RetryAfter as e:
-                # 限流：等待后继续删除
+                # 限流：等待后串行重试一次（重试不再并发，避免叠加触发限流）
                 wait = e.retry_after if hasattr(e, 'retry_after') and e.retry_after else 2
                 logger.warning("自动删除触发限流，等待 %ds", wait)
                 await asyncio.sleep(wait)
                 try:
                     await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                    deleted += 1
+                    deleted_box[0] += 1
                 except Exception:
                     pass
             except Exception:
                 pass  # 消息可能已被用户删除
-        if deleted > 0:
+
+        if concurrency > 1:
+            await asyncio.gather(*[_delete_one(mid) for mid in message_ids],
+                                 return_exceptions=True)
+        else:
+            for mid in message_ids:
+                await _delete_one(mid)
+
+        if deleted_box[0] > 0:
             logger.debug("自动删除: chat_id=%s 成功删除 %d/%d 条消息",
-                         chat_id, deleted, len(message_ids))
+                         chat_id, deleted_box[0], len(message_ids))
     except asyncio.CancelledError:
         pass
 
@@ -282,10 +288,18 @@ async def send_batch(bot, chat_id: int, files: List[Dict], caption: str = "",
 
     _start = time.time()
 
-    # 按类型分组
-    photo_video = [f for f in files if f['file_type'] in ('photo', 'video')]
-    documents = [f for f in files if f['file_type'] in ('document', 'voice')]
-    audios = [f for f in files if f['file_type'] == 'audio']
+    # 按类型分组（单次遍历，避免对 files 多次列表推导）
+    photo_video = []
+    documents = []
+    audios = []
+    for f in files:
+        ft = f['file_type']
+        if ft in ('photo', 'video'):
+            photo_video.append(f)
+        elif ft in ('document', 'voice'):
+            documents.append(f)
+        elif ft == 'audio':
+            audios.append(f)
 
     sent_count = 0
     all_msg_ids = []  # 收集所有消息ID（用于自动删除）

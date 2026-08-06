@@ -116,6 +116,7 @@ class SendQueue:
         self._current_chat_id: Optional[int] = None
         self._current_task: Optional[SendTask] = None
         self._current_send_task: Optional[asyncio.Task] = None
+        self._bg_tasks: set = set()  # 跟踪 fire-and-forget 后台 task，防止被 GC 回收
 
     @property
     def _redis_key(self) -> str:
@@ -135,6 +136,17 @@ class SendQueue:
             except Exception:
                 self._redis = False
         return self._redis if self._redis is not False else None
+
+    def _spawn_background(self, coro) -> asyncio.Task:
+        """安全地启动 fire-and-forget 后台 task
+
+        asyncio.create_task 返回的 task 若不保留引用，可能被 Python GC 提前回收
+        （官方文档明确警告）。这里用集合跟踪，完成后自动移除。
+        """
+        t = asyncio.create_task(coro)
+        self._bg_tasks.add(t)
+        t.add_done_callback(self._bg_tasks.discard)
+        return t
 
     async def _persist_task(self, task: SendTask):
         """将任务持久化到 Redis"""
@@ -266,7 +278,7 @@ class SendQueue:
             self._queues[chat_id] = []
         self._queues[chat_id].append(task)
         # 异步持久化
-        asyncio.create_task(self._persist_task(task))
+        self._spawn_background(self._persist_task(task))
         self._event.set()
         return task
 
@@ -281,7 +293,7 @@ class SendQueue:
                 tasks.remove(t)
                 removed += 1
                 # 异步从 Redis 移除
-                asyncio.create_task(self._remove_task(t))
+                self._spawn_background(self._remove_task(t))
         if not tasks and chat_id in self._queues:
             del self._queues[chat_id]
         if removed:
@@ -296,32 +308,10 @@ class SendQueue:
         返回被取消的任务数。
         """
         self._cancelled_chats.add(chat_id)
-
-        stopped = 0
-        # 取消当前正在发送的任务（如果有）
-        active_cancelled = False
-        if self._current_chat_id == chat_id and self._current_send_task and not self._current_send_task.done():
-            active_cancelled = True
-            logger.info("SendQueue(@%s): cancel_chat 取消当前正在发送的 chat_id=%s", self.bot_name, chat_id)
-            self._current_send_task.cancel()
-            if self._current_task and not self._current_task.future.done():
-                self._current_task.future.cancel()
-            stopped += 1
-            # Redis 清理由消费者的 CancelledError 处理器统一负责
-
-        # 取消队列中该用户的所有待处理任务
-        tasks = self._queues.pop(chat_id, [])
-        for t in tasks:
-            if not t.future.done():
-                t.future.cancel()
-                stopped += 1
-            asyncio.create_task(self._remove_task(t))
-
+        stopped = self._drain_chat(chat_id, cancel_futures=True, include_current=True,
+                                   log_prefix="cancel_chat")
         # 唤醒消费者（队列可能变空，需要重新检查）
         self._event.set()
-
-        logger.info("SendQueue(@%s): cancel_chat called chat_id=%s active_cancelled=%s pending=%d stopped=%d",
-                    self.bot_name, chat_id, active_cancelled, self.pending, stopped)
         return stopped
 
     def is_chat_cancelled(self, chat_id: int) -> bool:
@@ -338,22 +328,47 @@ class SendQueue:
         用于 _auto_send / _send_paginated 开始前清除 Redis 恢复的旧任务，
         避免旧任务 + 新提交重复发送。
         """
+        return self._drain_chat(chat_id, cancel_futures=True, log_prefix="clear_chat_pending")
+
+    def _drain_chat(self, chat_id: int, cancel_futures: bool = True,
+                    include_current: bool = False, log_prefix: str = "drain") -> int:
+        """统一清理某 chat 的排队任务（消费者内部复用，消除多处重复代码）
+
+        - 仅清理 self._queues 中该 chat 的待处理任务
+        - include_current=True 时同时取消正在发送的 _current_send_task
+        返回被取消的任务数
+        """
+        stopped = 0
+        if include_current and self._current_chat_id == chat_id:
+            if self._current_send_task and not self._current_send_task.done():
+                self._current_send_task.cancel()
+                logger.info("SendQueue(@%s): %s 取消正在发送的 chat_id=%s",
+                            self.bot_name, log_prefix, chat_id)
+            if self._current_task and not self._current_task.future.done():
+                self._current_task.future.cancel()
+            stopped += 1
+
         tasks = self._queues.pop(chat_id, [])
-        cleared = 0
         for t in tasks:
-            if not t.future.done():
+            if cancel_futures and not t.future.done():
                 t.future.cancel()
-                cleared += 1
-            asyncio.create_task(self._remove_task(t))
-        if cleared:
-            logger.info("SendQueue(@%s): clear_chat_pending=%s 清除 %d 个旧任务",
-                        self.bot_name, chat_id, cleared)
-        return cleared
+                stopped += 1
+            self._spawn_background(self._remove_task(t))
+
+        if stopped:
+            logger.info("SendQueue(@%s): %s chat_id=%s 清理 %d 个任务",
+                        self.bot_name, log_prefix, chat_id, stopped)
+        return stopped
 
     # ===== 消费者 =====
 
     async def _consume_loop(self):
-        """消费者主循环：Round-Robin 从各用户取任务"""
+        """消费者主循环：Round-Robin 从各用户取任务
+
+        优化点：用 OrderedDict 的 popitem(last=False) + move_to_end 实现真正的
+        轮转调度，避免每轮 list(self._queues.keys()) 全量复制（队列大时开销显著）。
+        每轮处理本批次就绪的所有 chat（队列快照期），逐个消费队首。
+        """
         from senders import send_batch
 
         # 启动时从 Redis 恢复未完成任务
@@ -375,50 +390,51 @@ class SendQueue:
                             self.bot_name, wait, self.pending)
                 await asyncio.sleep(wait)
 
-            # Round-Robin: 从每个用户取一个任务
+            # 本轮要处理的 chat 数量快照：只消费开始时已排队的用户，
+            # 新提交的 chat 留到下一轮，保证本轮能在有限步内结束。
+            batch_count = len(self._queues)
             processed_any = False
-            chat_ids = list(self._queues.keys())
 
-            for chat_id in chat_ids:
-                if not self._running:
+            for _ in range(batch_count):
+                if not self._running or not self._queues:
                     break
 
-                # 检查该用户是否已被 /stop 取消
+                # 取队首（O(1)，无需复制全部 keys）
+                chat_id, tasks = self._queues.popitem(last=False)
+
+                # 该 chat 已被 /stop 取消：清理后跳过
                 if chat_id in self._cancelled_chats:
-                    # 跳过并清理该用户的所有排队任务
-                    skip_tasks = self._queues.pop(chat_id, [])
-                    for t in skip_tasks:
+                    self._cancelled_chats.discard(chat_id)
+                    for t in tasks:
                         if not t.future.done():
                             t.future.cancel()
-                        asyncio.create_task(self._remove_task(t))
-                    self._cancelled_chats.discard(chat_id)
+                        self._spawn_background(self._remove_task(t))
                     logger.info("SendQueue(@%s): 消费者跳过已取消的 chat_id=%s (%d 个任务)",
-                                self.bot_name, chat_id, len(skip_tasks))
+                                self.bot_name, chat_id, len(tasks))
                     continue
 
-                tasks = self._queues.get(chat_id)
                 if not tasks:
                     continue
 
-                task = tasks.pop(0)
-                if not tasks:
-                    del self._queues[chat_id]
+                task = tasks[0]
+                cancelled_now = chat_id in self._cancelled_chats
 
-                # 再次检查：任务弹出后可能被 /stop 标记
-                if chat_id in self._cancelled_chats:
-                    if not task.future.done():
-                        task.future.cancel()
-                    asyncio.create_task(self._remove_task(task))
-                    # 清理剩余
-                    skip_tasks = self._queues.pop(chat_id, [])
-                    for t in skip_tasks:
-                        if not t.future.done():
-                            t.future.cancel()
-                        asyncio.create_task(self._remove_task(t))
-                    self._cancelled_chats.discard(chat_id)
-                    logger.info("SendQueue(@%s): 消费者取消正在处理的 chat_id=%s 任务",
-                                self.bot_name, chat_id)
-                    continue
+                # 如果该 chat 还有后续任务，先放回队尾（保证其它用户公平）
+                if len(tasks) > 1 and not cancelled_now:
+                    self._queues[chat_id] = tasks[1:]
+                    self._queues.move_to_end(chat_id)
+                else:
+                    # 只剩这一个任务（或已取消），不需要放回
+                    if cancelled_now:
+                        # 整组连同当前任务一起清理
+                        self._cancelled_chats.discard(chat_id)
+                        for t in tasks:
+                            if not t.future.done():
+                                t.future.cancel()
+                            self._spawn_background(self._remove_task(t))
+                        logger.info("SendQueue(@%s): 消费者取消正在处理的 chat_id=%s 任务",
+                                    self.bot_name, chat_id)
+                        continue
 
                 processed_any = True
 
@@ -430,16 +446,11 @@ class SendQueue:
 
                 # 发送前最终检查：可能在等待间隔期间被 /stop 取消
                 if chat_id in self._cancelled_chats:
+                    self._drain_chat(chat_id, cancel_futures=True, log_prefix="发送前最终检查取消")
+                    self._cancelled_chats.discard(chat_id)
                     if not task.future.done():
                         task.future.cancel()
-                    asyncio.create_task(self._remove_task(task))
-                    skip_tasks = self._queues.pop(chat_id, [])
-                    for t in skip_tasks:
-                        if not t.future.done():
-                            t.future.cancel()
-                        asyncio.create_task(self._remove_task(t))
-                    self._cancelled_chats.discard(chat_id)
-                    logger.info("SendQueue(@%s): 发送前最终检查取消 chat_id=%s", self.bot_name, chat_id)
+                    self._spawn_background(self._remove_task(task))
                     continue
 
                 # 发送
@@ -468,20 +479,18 @@ class SendQueue:
                         self._rate_limit_until = time.monotonic() + wait
                         logger.warning("SendQueue(@%s): Bot 限流 %.0fs，暂停整个队列 (触发者 chat_id=%s, 剩余队列=%d)",
                                        self.bot_name, wait, task.chat_id, self.pending)
-                        # 将任务放回队列头部（Redis 中不移除）
-                        if chat_id not in self._queues:
-                            self._queues[chat_id] = []
-                        self._queues[chat_id].insert(0, task)
-                        break  # 跳出用户循环，整个 Bot 队列等待
+                        # 将任务放回该 chat 队列头部（Redis 中不移除）
+                        existing = self._queues.get(chat_id)
+                        if existing is None:
+                            self._queues[chat_id] = [task]
+                            self._queues.move_to_end(chat_id, last=False)  # 限流重试者优先
+                        else:
+                            existing.insert(0, task)
+                            self._queues.move_to_end(chat_id, last=False)
+                        break  # 跳出本轮，整个 Bot 队列等待
                     elif isinstance(e, SendBlockedError):
                         # 用户已拉黑 Bot：取消该用户所有剩余任务
-                        cancelled = 0
-                        remaining = self._queues.pop(chat_id, [])
-                        for t in remaining:
-                            if not t.future.done():
-                                t.future.cancel()
-                                cancelled += 1
-                            await self._remove_task(t)
+                        cancelled = self._drain_chat(chat_id, cancel_futures=False, log_prefix="拉黑Bot取消剩余")
                         logger.warning("SendQueue(@%s): chat_id=%s 已拉黑 Bot，取消剩余 %d 个任务",
                                        self.bot_name, chat_id, cancelled)
                         if not task.future.done():
@@ -524,9 +533,18 @@ def split_files_to_batches(files: List[Dict], batch_size: int = None) -> List[Li
     from config import GROUP_SEND_SIZE
     size = batch_size or GROUP_SEND_SIZE
 
-    photo_video = [f for f in files if f['file_type'] in ('photo', 'video')]
-    documents = [f for f in files if f['file_type'] in ('document', 'voice')]
-    audios = [f for f in files if f['file_type'] == 'audio']
+    # 单次遍历分组，避免对 files 三次列表推导
+    photo_video = []
+    documents = []
+    audios = []
+    for f in files:
+        ft = f['file_type']
+        if ft in ('photo', 'video'):
+            photo_video.append(f)
+        elif ft in ('document', 'voice'):
+            documents.append(f)
+        elif ft == 'audio':
+            audios.append(f)
 
     batches = []
     for group in [photo_video, documents, audios]:

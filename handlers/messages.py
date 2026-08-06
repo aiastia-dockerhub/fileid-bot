@@ -18,18 +18,35 @@ from senders import send_file_group, _retry_send
 from send_queue import get_queue_from_context, split_files_to_batches
 
 
+def _ensure_cb_maps(context) -> tuple:
+    """获取或初始化 cb_map 正/反向索引，返回 (cb_map, cb_map_reverse)
+
+    cb_map:         sk -> col_code
+    cb_map_reverse: col_code -> sk   （避免每次反向查找都 O(n) 扫描）
+    """
+    cb_map = context.bot_data.get('cb_map')
+    if cb_map is None:
+        cb_map = {}
+        context.bot_data['cb_map'] = cb_map
+    cb_map_reverse = context.bot_data.get('cb_map_reverse')
+    if cb_map_reverse is None:
+        cb_map_reverse = {}
+        context.bot_data['cb_map_reverse'] = cb_map_reverse
+    return cb_map, cb_map_reverse
+
+
 async def _short_key(context, col_code: str) -> str:
     """生成短 key 用于 callback_data（Telegram 限制 64 字节）
-    
-    使用集合的数据库ID作为短key（c{id}），重启后仍可通过ID从数据库恢复。
-    """
-    if 'cb_map' not in context.bot_data:
-        context.bot_data['cb_map'] = {}
 
-    # 如果已存在映射，复用
-    for k, v in context.bot_data['cb_map'].items():
-        if v == col_code:
-            return k
+    使用集合的数据库ID作为短key（c{id}），重启后仍可通过ID从数据库恢复。
+    通过 cb_map_reverse 反向索引做 O(1) 复用查找。
+    """
+    cb_map, cb_map_reverse = _ensure_cb_maps(context)
+
+    # O(1) 复用查找
+    existing = cb_map_reverse.get(col_code)
+    if existing is not None:
+        return existing
 
     # 使用集合的数据库ID作为短key（重启不失效）
     col_info = await get_collection(col_code)
@@ -37,10 +54,11 @@ async def _short_key(context, col_code: str) -> str:
         key = f"c{col_info['id']}"
     else:
         # 降级：使用递增索引（仅当集合不在数据库中时）
-        idx = len(context.bot_data['cb_map'])
+        idx = len(cb_map)
         key = f"s{idx}"
 
-    context.bot_data['cb_map'][key] = col_code
+    cb_map[key] = col_code
+    cb_map_reverse[col_code] = key
     return key
 
 logger = logging.getLogger(__name__)

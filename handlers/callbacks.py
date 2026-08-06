@@ -1,6 +1,7 @@
 """回调按钮处理器模块"""
 import asyncio
 import logging
+import time
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
@@ -37,10 +38,17 @@ async def _resolve_key(context, sk: str) -> str:
         col_info = await get_collection_by_id(col_id)
         if col_info:
             col_code = col_info['code']
-            # 回填 cb_map 缓存
-            if 'cb_map' not in context.bot_data:
-                context.bot_data['cb_map'] = {}
-            context.bot_data['cb_map'][sk] = col_code
+            # 回填正/反向缓存（与 messages._ensure_cb_maps 保持一致）
+            cb_map = context.bot_data.get('cb_map')
+            if cb_map is None:
+                cb_map = {}
+                context.bot_data['cb_map'] = cb_map
+            cb_map[sk] = col_code
+            cb_map_reverse = context.bot_data.get('cb_map_reverse')
+            if cb_map_reverse is None:
+                cb_map_reverse = {}
+                context.bot_data['cb_map_reverse'] = cb_map_reverse
+            cb_map_reverse[col_code] = sk
             logger.info("_resolve_key: sk=%s, found=True (DB恢复 col_id=%d), col_code=%s", sk, col_id, col_code)
             return col_code
 
@@ -81,17 +89,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.debug("query.answer() 失败 (回调已过期，可忽略): %s", e)
 
     # === Telegram 回调去重（防止同一回调被投递2次导致重复发送） ===
+    # 用时间戳窗口替代 spawn 一个 sleep task 的写法，避免高频回调时的 task 风暴。
     if data and data != "noop":
-        recent_cb_key = f"_rcb_{chat_id}_{data}"
-        if context.bot_data.get(recent_cb_key):
+        rcb = context.bot_data.get('_rcb_seen')
+        if rcb is None:
+            rcb = {}
+            context.bot_data['_rcb_seen'] = rcb
+        now = time.monotonic()
+        recent_cb_key = f"{chat_id}_{data}"
+        last_ts = rcb.get(recent_cb_key)
+        if last_ts is not None and now - last_ts < 5:
             logger.warning("回调去重: 重复回调已忽略 data=%r chat_id=%s", data, chat_id)
             return
-        context.bot_data[recent_cb_key] = True
-        # 5秒后自动清除标记
-        async def _clear_cb_key():
-            await asyncio.sleep(5)
-            context.bot_data.pop(recent_cb_key, None)
-        asyncio.create_task(_clear_cb_key())
+        rcb[recent_cb_key] = now
+        # 惰性清理：条目超过 200 个时清掉过期项，防止 dict 无限增长
+        if len(rcb) > 200:
+            cutoff = now - 5
+            stale = [k for k, ts in rcb.items() if ts < cutoff]
+            for k in stale:
+                del rcb[k]
 
     # === 防止重复点击：立即移除原消息按钮 ===
     if data != "noop":
@@ -510,13 +526,8 @@ async def _send_page(context, chat_id, col_code, page, query=None):
         size_text = f"{size_mb:.1f}MB" if size_mb >= 1 else f"{f['file_size'] / 1024:.0f}KB" if f['file_size'] else "未知"
         text += f"{i}. {type_name} ({size_text})\n"
 
-    # 获取短 key
-    sk = None
-    cb_map = context.bot_data.get('cb_map', {})
-    for k, v in cb_map.items():
-        if v == col_code:
-            sk = k
-            break
+    # 获取短 key（优先用反向索引做 O(1) 查找）
+    sk = context.bot_data.get('cb_map_reverse', {}).get(col_code)
     if not sk:
         from handlers.messages import _short_key
         sk = await _short_key(context, col_code)

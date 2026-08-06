@@ -83,21 +83,34 @@ async def save_file(user_id: int, file_type: str, file_id: str,
                     return existing_row
 
             # 生成唯一代码
+            # 文件 code 格式为 {code_prefix}_{p|v|d}:{raw}，集合为 {code_prefix}_col:{raw}，
+            # 因 prefix 不同实际不会跨表冲突，这里主要靠 file_mappings 自身的唯一约束兜底。
+            # 优化：限制重试次数（碰撞概率极低），并优先检查高频命中的 file_mappings 表。
             chars = string.ascii_letters + string.digits
-            while True:
+            prefix = FILE_TYPE_PREFIX.get(file_type, 'd')
+            max_attempts = 5  # 6 字符字母+数字碰撞概率极低，5 次足够
+            full_code = None
+            for _ in range(max_attempts):
                 raw_code = ''.join(random.choices(chars, k=CODE_LENGTH))
-                # 检查 code 是否已存在于 file_mappings 或 collections
-                file_result = await session.execute(
-                    select(FileMapping.id).where(FileMapping.code == raw_code).limit(1)
+                candidate = f"{code_prefix}_{prefix}:{raw_code}"
+                # 一次查询同时检查两表是否存在
+                exists = await session.execute(
+                    select(FileMapping.id).where(FileMapping.code == candidate).limit(1)
                 )
-                col_result = await session.execute(
-                    select(Collection.id).where(Collection.code == raw_code).limit(1)
+                if exists.scalar_one_or_none():
+                    continue
+                exists_col = await session.execute(
+                    select(Collection.id).where(Collection.code == candidate).limit(1)
                 )
-                if not file_result.scalar_one_or_none() and not col_result.scalar_one_or_none():
+                if not exists_col.scalar_one_or_none():
+                    full_code = candidate
                     break
 
-            prefix = FILE_TYPE_PREFIX.get(file_type, 'd')
-            full_code = f"{code_prefix}_{prefix}:{raw_code}"
+            if full_code is None:
+                # 极端情况（多次碰撞），最后兜底交由唯一约束处理
+                logger.error("代码生成多次碰撞，降级为随机尝试")
+                raw_code = ''.join(random.choices(chars, k=CODE_LENGTH))
+                full_code = f"{code_prefix}_{prefix}:{raw_code}"
 
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
