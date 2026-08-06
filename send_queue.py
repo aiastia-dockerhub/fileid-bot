@@ -489,8 +489,9 @@ class SendQueue:
                             self._queues.move_to_end(chat_id, last=False)
                         break  # 跳出本轮，整个 Bot 队列等待
                     elif isinstance(e, SendBlockedError):
-                        # 用户已拉黑 Bot：取消该用户所有剩余任务
-                        cancelled = self._drain_chat(chat_id, cancel_futures=False, log_prefix="拉黑Bot取消剩余")
+                        # 用户已拉黑 Bot：取消该用户所有剩余任务（future 必须 cancel，
+                        # 否则 submit_batch 的调用方会永久 await——这是重构回归 bug 的修复点）
+                        cancelled = self._drain_chat(chat_id, cancel_futures=True, log_prefix="拉黑Bot取消剩余")
                         logger.warning("SendQueue(@%s): chat_id=%s 已拉黑 Bot，取消剩余 %d 个任务",
                                        self.bot_name, chat_id, cancelled)
                         if not task.future.done():
