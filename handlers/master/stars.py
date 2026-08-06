@@ -7,7 +7,7 @@ from senders import _retry_send
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import ContextTypes
 
-from config import VIP_PLANS, VIP_EXPIRE_NOTICE_DAYS, PREMIUM_GIFT_PRICES, PREMIUM_USER_MARKUP
+from config import VIP_PLANS, VIP_FEATURES, VIP_EXPIRE_NOTICE_DAYS, PREMIUM_GIFT_PRICES, PREMIUM_USER_MARKUP
 from db.vip import (
     get_user_vip_info, get_user_vip_level, get_max_bots_for_user,
     update_user_vip, record_star_payment, get_payment_history,
@@ -53,18 +53,36 @@ async def vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # 显示各等级对比
     for level in sorted(VIP_PLANS.keys()):
         plan = VIP_PLANS[level]
+        # 拼接该等级的特权标注（目前只有转发保护）
+        features = VIP_FEATURES.get(level, {})
+        feature_tags = []
+        if features.get('forward_mode'):
+            feature_tags.append("🔒 含转发保护")
+        feature_text = f"  {'  '.join(feature_tags)}" if feature_tags else ""
+
         if level == 0:
-            text += f"  {plan['name']} — {plan['max_bots']} 个 Bot — 免费\n"
+            text += f"  {plan['name']} — {plan['max_bots']} 个 Bot — 免费{feature_text}\n"
         else:
             stars = "⭐" * level
             monthly = plan['monthly_price']
             yearly = plan['yearly_price']
             current = "  ✅ 当前" if level == vip_info['vip_level'] and vip_info['is_active'] else ""
-            text += f"  {stars} {plan['name']} — {plan['max_bots']} 个 Bot — 月付 {monthly}⭐ / 年付 {yearly}⭐{current}\n"
+            text += f"  {stars} {plan['name']} — {plan['max_bots']} 个 Bot — 月付 {monthly}⭐ / 年付 {yearly}⭐{current}{feature_text}\n"
 
     text += (
         f"\n💡 年付享优惠（约 10 个月价格）\n"
-        f"续费时间会自动叠加，不会浪费"
+        f"续费时间会自动叠加，不会浪费\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔒 <b>转发保护</b>（VIP 1+ 独有）\n"
+        f"控制你 Bot 发送的图片/视频是否允许被接收者转发或保存。\n\n"
+        f"<b>如何设置：</b>\n"
+        f"1. 发送 /mybots 打开 Bot 列表\n"
+        f"2. 点击对应 Bot 下方的「🔒 @botusername - 模式」按钮\n"
+        f"3. 选择转发模式：\n"
+        f"   ✅ 允许转发 — 默认，接收者可转发/保存\n"
+        f"   🚫 禁止转发 — 接收者无法转发或保存\n"
+        f"   👤 用户自选 — 由每位接收者自己决定\n"
+        f"4. 设置即时生效，仅对新发送的媒体有效"
     )
 
     # 构建购买按钮
