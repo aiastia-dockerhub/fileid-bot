@@ -32,12 +32,17 @@ class RedisManager:
         # 内存降级方案
         self._memory_cache: Dict[str, tuple] = {}  # key -> (value, expire_at)
         self._rate_windows: Dict[str, list] = {}  # key -> [timestamp, ...]
-        self._counters: Dict[str, int] = {}
+        self._counters: Dict[str, tuple] = {}  # key -> (value, last_access_ts)
         # 内存降级模式下的惰性清理：每 _GC_INTERVAL 次写操作做一次过期扫描
         self._op_count = 0
         self._last_gc = 0.0
         self._GC_INTERVAL = 2000
-        self._GC_MAX_AGE = 7200  # 计数器/限流窗口超过 2 小时未访问即回收
+        self._GC_MAX_AGE = 7200  # 限流窗口超过 2 小时未访问即回收
+        # 计数器 GC：按最后访问时间回收（stats:sent:{date} 的 Redis TTL 为 2 天，
+        # 内存模式对齐为 26 小时：当天的计数器全天都有写入不会被误清）
+        self._COUNTER_GC_AGE = 26 * 3600
+        self._MEMORY_CACHE_MAX = 20000  # _memory_cache 容量上限（项数）
+        self._COUNTERS_MAX = 50000      # _counters 容量上限（项数）
 
     async def init(self):
         """初始化 Redis 连接"""
@@ -80,9 +85,9 @@ class RedisManager:
         """内存降级模式下的惰性 GC：清理过期缓存和长期未访问的限流/计数器 key
 
         仅在内存模式生效，Redis 模式下由 Redis 自身处理过期。
-        - _memory_cache：删除已过期项
+        - _memory_cache：删除已过期项；超容量时按过期时间丢最旧的
         - _rate_windows：删除空窗口和超过 _GC_MAX_AGE 未访问的 key
-        - _counters：删除超过 _GC_MAX_AGE 未访问的 key（需记录访问时间）
+        - _counters：删除超过 _COUNTER_GC_AGE 未访问的 key；超容量时丢最旧的一半
         """
         now = time.time()
         if now - self._last_gc < self._GC_INTERVAL / 10:
@@ -95,6 +100,12 @@ class RedisManager:
             expired = [k for k, (_, exp) in self._memory_cache.items() if exp and now > exp]
             for k in expired:
                 del self._memory_cache[k]
+            # 容量保护：仍超限则按过期时间丢最旧的一半
+            if len(self._memory_cache) > self._MEMORY_CACHE_MAX:
+                oldest = sorted(self._memory_cache,
+                                key=lambda k: self._memory_cache[k][1] or 0)
+                for k in oldest[:len(self._memory_cache) - self._MEMORY_CACHE_MAX // 2]:
+                    del self._memory_cache[k]
 
         # 清理空/陈旧的限流窗口
         if self._rate_windows:
@@ -102,8 +113,15 @@ class RedisManager:
             for k in stale:
                 del self._rate_windows[k]
 
-        # 计数器：只清理带 TTL 标记且已过期的（counter_incr 不记录访问时间，
-        # 因此对 _counters 不做激进回收，避免清掉仍有业务意义的统计值）
+        # 清理长期未访问的计数器（带最后访问时间，可安全回收）
+        if self._counters:
+            stale = [k for k, (_, ts) in self._counters.items() if now - ts > self._COUNTER_GC_AGE]
+            for k in stale:
+                del self._counters[k]
+            if len(self._counters) > self._COUNTERS_MAX:
+                oldest = sorted(self._counters, key=lambda k: self._counters[k][1])
+                for k in oldest[:len(self._counters) - self._COUNTERS_MAX // 2]:
+                    del self._counters[k]
 
     # ==================== 缓存 ====================
 
@@ -243,8 +261,11 @@ class RedisManager:
                 logger.warning("Redis counter_incr 失败: %s", e)
                 return 0
         else:
-            self._counters[key] = self._counters.get(key, 0) + 1
-            return self._counters[key]
+            entry = self._counters.get(key)
+            value = (entry[0] if entry else 0) + 1
+            self._counters[key] = (value, time.time())
+            self._maybe_gc()
+            return value
 
     async def counter_get(self, key: str) -> int:
         """获取计数器值"""
@@ -256,7 +277,12 @@ class RedisManager:
                 logger.warning("Redis counter_get 失败: %s", e)
                 return 0
         else:
-            return self._counters.get(key, 0)
+            entry = self._counters.get(key)
+            if entry is None:
+                return 0
+            # 刷新最后访问时间，避免活跃计数器被 GC 误清
+            self._counters[key] = (entry[0], time.time())
+            return entry[0]
 
     # ==================== 发送队列持久化 ====================
 

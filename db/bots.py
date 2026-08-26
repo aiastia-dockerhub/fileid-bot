@@ -1,5 +1,6 @@
 """用户Bot管理相关数据库函数（Async SQLAlchemy）"""
 import logging
+import time
 from datetime import datetime
 from typing import Optional, List, Dict
 
@@ -10,6 +11,13 @@ from db.core import get_session, _model_to_dict
 from db.models import UserBot, UserBlacklist, PlatformSetting
 
 logger = logging.getLogger(__name__)
+
+# ==================== 黑名单查询缓存 ====================
+# blacklist_check_handler 是主 Bot 每条 update 都会走的中间件，
+# 不缓存时等于每条消息查一次 DB。TTL 60s，黑名单增删时主动失效。
+_blacklist_cache: Dict[int, tuple] = {}  # user_id -> (is_blacklisted, ts)
+_BLACKLIST_TTL = 60
+_BLACKLIST_CACHE_MAX = 20000
 
 
 async def add_user_bot(owner_id: int, bot_token: str, bot_id: int,
@@ -273,6 +281,7 @@ async def add_to_blacklist(user_id: int, reason: str = '') -> bool:
             else:
                 session.add(UserBlacklist(user_id=user_id, reason=reason, created_at=now))
             await session.commit()
+            _blacklist_cache.pop(user_id, None)  # 立即失效
             return True
         except Exception as e:
             logger.error("添加黑名单失败: %s", e)
@@ -290,6 +299,7 @@ async def remove_from_blacklist(user_id: int) -> bool:
             if entry:
                 await session.delete(entry)
                 await session.commit()
+                _blacklist_cache.pop(user_id, None)  # 立即失效
                 return True
             return False
         except Exception as e:
@@ -298,12 +308,29 @@ async def remove_from_blacklist(user_id: int) -> bool:
 
 
 async def is_user_blacklisted(user_id: int) -> bool:
-    """检查用户是否在黑名单中"""
+    """检查用户是否在黑名单中（带 60s TTL 缓存，黑名单增删时主动失效）"""
+    now = time.time()
+    entry = _blacklist_cache.get(user_id)
+    if entry is not None and now - entry[1] < _BLACKLIST_TTL:
+        return entry[0]
+
     async with get_session() as session:
         result = await session.execute(
             select(UserBlacklist.id).where(UserBlacklist.user_id == user_id).limit(1)
         )
-        return result.scalar_one_or_none() is not None
+        blacklisted = result.scalar_one_or_none() is not None
+
+    # 容量保护：超限时先清过期项，仍超限则丢最旧的一半
+    if len(_blacklist_cache) >= _BLACKLIST_CACHE_MAX:
+        expired = [k for k, (_, ts) in _blacklist_cache.items() if now - ts >= _BLACKLIST_TTL]
+        for k in expired:
+            del _blacklist_cache[k]
+        if len(_blacklist_cache) >= _BLACKLIST_CACHE_MAX:
+            for k in sorted(_blacklist_cache, key=lambda k: _blacklist_cache[k][1])[:_BLACKLIST_CACHE_MAX // 2]:
+                del _blacklist_cache[k]
+
+    _blacklist_cache[user_id] = (blacklisted, now)
+    return blacklisted
 
 
 async def get_blacklist() -> List[Dict]:

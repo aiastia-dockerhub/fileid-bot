@@ -219,6 +219,26 @@ async def get_files_by_bot_db_id(bot_db_id: int) -> List[Dict]:
         ]
 
 
+async def stream_files_by_bot_db_id(bot_db_id: int):
+    """流式导出指定 Bot 的文件记录（每次取 500 行，避免全量载入内存）
+
+    用于 /export 大数据量场景：几十万行一次性 fetchall 会造成数百 MB 内存尖峰。
+    注意：迭代期间不要执行耗时 await（如 Telegram 发送），以免长时间占用连接。
+    """
+    from typing import AsyncGenerator
+    async with get_session() as session:
+        result = await session.stream(
+            select(
+                FileMapping.code, FileMapping.file_type, FileMapping.file_size,
+                FileMapping.user_id, FileMapping.created_at
+            ).where(FileMapping.bot_db_id == bot_db_id)
+            .order_by(FileMapping.created_at.desc())
+        )
+        async for r in result.yield_per(500):
+            yield {'code': r[0], 'file_type': r[1], 'file_size': r[2],
+                  'user_id': r[3], 'created_at': r[4]}
+
+
 async def get_recent_files_for_bot(
     bot_db_id: int,
     file_type: str = None,

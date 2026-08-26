@@ -2,7 +2,7 @@
 import logging
 from typing import Dict, List
 
-from sqlalchemy import select, func, text
+from sqlalchemy import select, func, text, or_
 
 from db.core import get_session
 from db.models import FileMapping, Collection, UserBot
@@ -116,6 +116,9 @@ async def get_platform_stats() -> Dict:
 async def get_platform_bot_details(status: str = 'active') -> List[Dict]:
     """获取平台级 Bot 详情列表（含文件数统计）
 
+    优化：原实现对每个 Bot 发 4 条 COUNT（N 个 Bot = 4N+1 次查询），
+    现改为 1 次查 Bot 列表 + 4 次聚合查询（GROUP BY bot_db_id）。
+
     Args:
         status: 筛选状态，默认 'active'。传 'all' 显示所有非删除的。
     """
@@ -123,73 +126,70 @@ async def get_platform_bot_details(status: str = 'active') -> List[Dict]:
     today = datetime.now().strftime("%Y-%m-%d")
 
     async with get_session() as session:
-        if status == 'all':
-            query = select(UserBot).where(UserBot.status != 'deleted')
-        else:
-            query = select(UserBot).where(UserBot.status == status)
-        result = await session.execute(
-            query.order_by(UserBot.bot_username)
+        cols = (
+            UserBot.id, UserBot.bot_username, UserBot.bot_firstname,
+            UserBot.bot_id, UserBot.owner_id, UserBot.status, UserBot.created_at,
         )
-        bots = result.scalars().all()
+        if status == 'all':
+            query = select(*cols).where(UserBot.status != 'deleted')
+        else:
+            query = select(*cols).where(UserBot.status == status)
+        result = await session.execute(query.order_by(UserBot.bot_username))
+        bots = result.fetchall()
 
-        details = []
-        for bot in bots:
-            file_count = 0
-            today_file_count = 0
-            col_count = 0
-            user_count = 0
-            try:
-                r = await session.execute(
-                    select(func.count()).select_from(FileMapping).where(FileMapping.bot_db_id == bot.id)
-                )
-                file_count = r.scalar() or 0
-            except Exception:
-                pass
-            try:
-                r = await session.execute(
-                    select(func.count()).select_from(FileMapping)
-                    .where(FileMapping.bot_db_id == bot.id, FileMapping.created_at >= today)
-                )
-                today_file_count = r.scalar() or 0
-            except Exception:
-                pass
-            try:
-                r = await session.execute(
-                    select(func.count()).select_from(Collection).where(
-                        Collection.bot_db_id == bot.id, Collection.status == 'completed'
-                    )
-                )
-                col_count = r.scalar() or 0
-            except Exception:
-                pass
-            try:
-                r = await session.execute(
-                    select(func.count(func.distinct(FileMapping.user_id))).select_from(FileMapping)
-                    .where(FileMapping.bot_db_id == bot.id)
-                )
-                user_count = r.scalar() or 0
-            except Exception:
-                pass
+        # 4 条聚合查询，替代每 Bot 4 条 COUNT
+        result = await session.execute(
+            select(FileMapping.bot_db_id, func.count())
+            .where(FileMapping.bot_db_id.isnot(None))
+            .group_by(FileMapping.bot_db_id)
+        )
+        file_counts = dict(result.fetchall())
 
-            details.append({
-                'id': bot.id,
-                'bot_username': bot.bot_username or '',
-                'bot_firstname': bot.bot_firstname or bot.bot_username or '',
-                'bot_id': bot.bot_id or '',
-                'owner_id': bot.owner_id,
-                'status': bot.status,
-                'created_at': bot.created_at or '',
-                'file_count': file_count,
-                'today_file_count': today_file_count,
-                'col_count': col_count,
-                'user_count': user_count,
-            })
+        result = await session.execute(
+            select(FileMapping.bot_db_id, func.count())
+            .where(FileMapping.bot_db_id.isnot(None), FileMapping.created_at >= today)
+            .group_by(FileMapping.bot_db_id)
+        )
+        today_counts = dict(result.fetchall())
 
-        return details
+        result = await session.execute(
+            select(Collection.bot_db_id, func.count())
+            .where(Collection.bot_db_id.isnot(None), Collection.status == 'completed')
+            .group_by(Collection.bot_db_id)
+        )
+        col_counts = dict(result.fetchall())
+
+        result = await session.execute(
+            select(FileMapping.bot_db_id, func.count(func.distinct(FileMapping.user_id)))
+            .where(FileMapping.bot_db_id.isnot(None))
+            .group_by(FileMapping.bot_db_id)
+        )
+        user_counts = dict(result.fetchall())
+
+        return [
+            {
+                'id': b[0],
+                'bot_username': b[1] or '',
+                'bot_firstname': b[2] or b[1] or '',
+                'bot_id': b[3] or '',
+                'owner_id': b[4],
+                'status': b[5],
+                'created_at': b[6] or '',
+                'file_count': file_counts.get(b[0], 0),
+                'today_file_count': today_counts.get(b[0], 0),
+                'col_count': col_counts.get(b[0], 0),
+                'user_count': user_counts.get(b[0], 0),
+            }
+            for b in bots
+        ]
 
 
 async def get_platform_export_data() -> Dict:
-    """导出平台全部数据（Bot、文件、集合、黑名单）"""
+    """导出平台全部数据（Bot、文件、集合、黑名单）
+
+    ⚠️ 全量载入内存，仅适用于数据量小的场景；
+    大数据量导出请使用下方 stream_* 系列流式函数。
+    """
     async with get_session() as session:
         from db.models import UserBlacklist
         from db.core import _model_to_dict
@@ -224,3 +224,98 @@ async def get_platform_export_data() -> Dict:
             'collections': collections,
             'blacklist': blacklist,
         }
+
+
+# ==================== 流式导出（大数据量防内存尖峰） ====================
+
+async def stream_active_bot_files(since_date: str = None):
+    """流式获取活跃Bot的文件列表（每次取 500 行）
+
+    用于 /export csv，替代 get_active_bot_files 的全量 fetchall。
+    迭代期间避免执行耗时 await，以免长时间占用数据库连接。
+    """
+    query = (
+        select(
+            FileMapping.code, FileMapping.bot_username, FileMapping.file_type,
+            FileMapping.file_size, FileMapping.user_id, FileMapping.created_at
+        )
+        .join(UserBot, FileMapping.bot_db_id == UserBot.id)
+        .where(
+            UserBot.status == 'active',
+            or_(FileMapping.is_valid.is_(None), FileMapping.is_valid == 1)
+        )
+    )
+    if since_date:
+        query = query.where(FileMapping.created_at >= since_date)
+    query = query.order_by(FileMapping.bot_username, FileMapping.created_at)
+
+    async with get_session() as session:
+        result = await session.stream(query)
+        async for r in result.yield_per(500):
+            yield {'code': r[0], 'bot_username': r[1], 'file_type': r[2],
+                  'file_size': r[3], 'user_id': r[4], 'created_at': r[5]}
+
+
+async def stream_export_bots():
+    """流式导出所有非删除 Bot 记录"""
+    async with get_session() as session:
+        result = await session.stream(
+            select(UserBot).where(UserBot.status != 'deleted').order_by(UserBot.created_at)
+        )
+        async for chunk in result.yield_per(500):
+            for b in chunk:
+                yield {
+                    'id': b.id, 'owner_id': b.owner_id, 'bot_id': b.bot_id,
+                    'bot_username': b.bot_username, 'bot_firstname': b.bot_firstname,
+                    'status': b.status, 'created_at': b.created_at,
+                }
+
+
+async def stream_export_files():
+    """流式导出所有文件记录"""
+    async with get_session() as session:
+        result = await session.stream(
+            select(FileMapping).order_by(FileMapping.created_at)
+        )
+        async for chunk in result.yield_per(500):
+            for f in chunk:
+                yield {
+                    'id': f.id, 'code': f.code, 'bot_username': f.bot_username,
+                    'file_type': f.file_type, 'telegram_file_id': f.telegram_file_id,
+                    'file_size': f.file_size, 'file_unique_id': f.file_unique_id,
+                    'user_id': f.user_id, 'created_at': f.created_at,
+                    'is_valid': f.is_valid, 'bot_db_id': f.bot_db_id,
+                    'source_chat_id': f.source_chat_id,
+                    'source_message_id': f.source_message_id,
+                }
+
+
+async def stream_export_collections():
+    """流式导出所有集合记录"""
+    async with get_session() as session:
+        result = await session.stream(
+            select(Collection).order_by(Collection.created_at)
+        )
+        async for chunk in result.yield_per(500):
+            for c in chunk:
+                yield {
+                    'id': c.id, 'code': c.code, 'bot_username': c.bot_username,
+                    'name': c.name, 'user_id': c.user_id, 'file_count': c.file_count,
+                    'status': c.status, 'created_at': c.created_at,
+                    'updated_at': c.updated_at, 'bot_db_id': c.bot_db_id,
+                }
+
+
+async def stream_export_blacklist():
+    """流式导出黑名单"""
+    from db.models import UserBlacklist
+    async with get_session() as session:
+        result = await session.stream(
+            select(UserBlacklist).order_by(UserBlacklist.created_at)
+        )
+        async for chunk in result.yield_per(500):
+            for b in chunk:
+                yield {
+                    'id': b.id, 'user_id': b.user_id, 'reason': b.reason,
+                    'created_at': b.created_at,
+                }

@@ -345,6 +345,7 @@ async def _send_paginated(context, chat_id, col_code, sk, page=1, query=None):
         text += f"📊 进度: {len(sent_pages)}/{total_pages} 页"
         if len(sent_pages) >= total_pages:
             text += "\n\n🎉 所有文件已发送完毕！"
+            context.user_data.pop(sent_key, None)  # 发完即清理，防 user_data 积累
             await _safe_edit_query(query, context, chat_id, text, parse_mode="Markdown")
         else:
             # 只显示未发送页的按钮
@@ -379,6 +380,7 @@ async def _send_paginated(context, chat_id, col_code, sk, page=1, query=None):
     # 全部发送完毕：不显示任何按钮，防止重复操作
     if len(sent_pages) >= total_pages:
         text += "\n\n🎉 所有文件已发送完毕！"
+        context.user_data.pop(sent_key, None)  # 发完即清理，防 user_data 积累
         await _safe_edit_query(query, context, chat_id, text, parse_mode="Markdown")
         return
 

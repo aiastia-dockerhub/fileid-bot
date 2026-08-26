@@ -76,6 +76,11 @@ class _BotRateLimiter:
         """更新 Bot 的最后调用时间（用于 RetryAfter 等待后刷新）"""
         self._bot_last_call[bot_name] = time.monotonic()
 
+    def remove(self, bot_name: str):
+        """移除 Bot 的限速锁和状态（Bot 停止时调用，防止 dict 无限增长）"""
+        self._bot_locks.pop(bot_name, None)
+        self._bot_last_call.pop(bot_name, None)
+
 
 # 全局单例
 _rate_limiter = _BotRateLimiter()

@@ -51,6 +51,19 @@ async def stop_all_queues():
     _queues.clear()
 
 
+async def stop_queue(bot_name: str) -> bool:
+    """停止并移除某 Bot 的发送队列（Bot 停止时调用）
+
+    不清理的话，队列消费者协程会一直挂着，并强引用已停止 Bot 的
+    Application/ExtBot/HTTPX 连接池，造成内存泄漏。
+    """
+    q = _queues.pop(bot_name, None)
+    if q is None:
+        return False
+    await q.stop()
+    return True
+
+
 # ===== 任务 =====
 
 class SendTask:

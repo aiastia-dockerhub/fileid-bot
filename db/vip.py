@@ -360,6 +360,9 @@ async def get_paused_bots_by_owner(owner_id: int) -> List[Dict]:
 _forward_mode_cache: dict = {}      # {bot_db_id: (mode, timestamp)}
 _user_pref_cache: dict = {}          # {(user_id, bot_db_id): (protect, timestamp)}
 _CACHE_TTL = 300                     # 缓存 5 分钟
+# 容量上限：key 数只增不减会随 用户×Bot 组合无限增长（慢性内存泄漏），
+# 超限时先清过期项，仍超限则按写入时间丢最旧的一半
+_CACHE_MAX = 20000
 
 
 def _cache_get(cache: dict, key):
@@ -371,7 +374,15 @@ def _cache_get(cache: dict, key):
 
 
 def _cache_set(cache: dict, key, value):
-    """写入缓存"""
+    """写入缓存（带容量保护）"""
+    if len(cache) >= _CACHE_MAX:
+        now = time.time()
+        expired = [k for k, (_, ts) in cache.items() if now - ts >= _CACHE_TTL]
+        for k in expired:
+            del cache[k]
+        if len(cache) >= _CACHE_MAX:
+            for k in sorted(cache, key=lambda k: cache[k][1])[:_CACHE_MAX // 2]:
+                del cache[k]
     cache[key] = (value, time.time())
 
 
@@ -409,12 +420,7 @@ async def set_bot_forward_mode(bot_db_id: int, mode: int) -> bool:
             await session.commit()
             _cache_set(_forward_mode_cache, bot_db_id, mode)
             # Bot 模式变更时，清除该 Bot 所有用户偏好缓存
-            _user_pref_cache.update(
-                {k: v for k, v in list(_user_pref_cache.items()) if k[1] != bot_db_id}
-            )
-            # 实际上是删除，重建缓存
-            to_del = [k for k in _user_pref_cache if k[1] == bot_db_id]
-            for k in to_del:
+            for k in [k for k in _user_pref_cache if k[1] == bot_db_id]:
                 del _user_pref_cache[k]
             return True
         except Exception as e:

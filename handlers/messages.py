@@ -548,16 +548,18 @@ async def handle_forwarded_media(update: Update, context: ContextTypes.DEFAULT_T
             full_col_code = f"{code_prefix}_col:{generate_raw_code()}"
 
             # 保存集合到数据库（使用 async ORM）
-            from db import create_collection, add_file_to_collection, complete_collection
+            from db import create_collection, complete_collection, batch_add_codes_to_collection
             bot_db_id = context.bot_data.get('bot_record', {}).get('id')
 
             save_ok = False
             try:
                 if await create_collection(full_col_code, bname, col_name, uid, bot_db_id=bot_db_id):
-                    for i, code in enumerate(codes):
-                        await add_file_to_collection(full_col_code, code, i + 1)
-                    await complete_collection(full_col_code, len(codes))
-                    save_ok = True
+                    # 批量添加（1-2 次查询），替代原来逐文件 add_file_to_collection
+                    # 的 N 次独立 session+commit（媒体组大时显著提速）
+                    add_result = await batch_add_codes_to_collection(
+                        full_col_code, codes, bot_db_id=bot_db_id, start_sort=0)
+                    await complete_collection(full_col_code, add_result['added'])
+                    save_ok = add_result['added'] > 0
             except Exception as e:
                 logger.error("自动创建转发集合失败: %s", e)
             if not save_ok:
@@ -643,14 +645,18 @@ def _get_auto_delete(context) -> int:
 
 
 async def _add_to_collection(context, col_code, codes):
-    """将代码列表添加到集合"""
+    """将代码列表添加到集合（批量插入，避免逐条 session+commit）"""
     current_count = context.user_data.get('collection_count', 0)
-    for i, code in enumerate(codes):
-        if current_count + i + 1 > MAX_COLLECTION_FILES:
-            break
-        await add_file_to_collection(col_code, code, current_count + i + 1)
-    new_count = min(current_count + len(codes), MAX_COLLECTION_FILES)
-    context.user_data['collection_count'] = new_count
+    remaining = MAX_COLLECTION_FILES - current_count
+    if remaining <= 0 or not codes:
+        return
+    take = codes[:remaining]
+
+    from db import batch_add_codes_to_collection
+    bot_db_id = context.bot_data.get('bot_record', {}).get('id')
+    result = await batch_add_codes_to_collection(
+        col_code, take, bot_db_id=bot_db_id, start_sort=current_count)
+    context.user_data['collection_count'] = current_count + result['added']
 
 
 async def _handle_pack_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:

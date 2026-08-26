@@ -45,13 +45,16 @@ def _create_engine() -> AsyncEngine:
     url = _build_database_url()
     engine_kwargs = {
         'echo': False,
-        'pool_pre_ping': True,
     }
     if DB_TYPE == 'sqlite':
         # SQLite 特定配置
         engine_kwargs['connect_args'] = {'timeout': 30}
-        # WAL 模式通过 on_connect 事件设置
+        # WAL/synchronous 模式通过 on_connect 事件设置
+        # 注意：pre_ping 对 SQLite 无意义（本地文件无连接断开概念），
+        # 且每次取连接多一次 SELECT 1 往返，这里显式关闭
+        engine_kwargs['pool_pre_ping'] = False
     else:
+        engine_kwargs['pool_pre_ping'] = True
         engine_kwargs.update({
             'pool_size': 10,
             'max_overflow': 20,
@@ -67,6 +70,9 @@ def _create_engine() -> AsyncEngine:
         def _set_sqlite_pragma(dbapi_conn, connection_record):
             cursor = dbapi_conn.cursor()
             cursor.execute("PRAGMA journal_mode=WAL")
+            # WAL 配套优化：NORMAL 模式下 commit 不强制 fsync，
+            # 本项目几乎每个写操作都单独 commit，FULL 模式写放大严重
+            cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.close()
 
     return engine
@@ -180,12 +186,31 @@ async def init_db():
             # user_bot_prefs 索引
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ubp_user_bot ON user_bot_prefs(user_id, bot_db_id)"))
 
+            # 性能关键索引：
+            # save_file 去重查询 WHERE file_unique_id=? AND bot_db_id=?，
+            # 缺此索引时每次存文件都全表扫描（表大后写延迟雪崩）
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_file_fuid_bot ON file_mappings(bot_db_id, file_unique_id)"))
+            # /ex 与导出的 ORDER BY created_at DESC 过滤
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_file_created_bot ON file_mappings(bot_db_id, created_at)"))
+
             # 回填 bot_db_id
             await _backfill_bot_db_id(conn)
     else:
         # MySQL: 使用 CREATE TABLE IF NOT EXISTS（通过 ORM metadata）
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+
+            # MySQL 不支持 CREATE INDEX IF NOT EXISTS，用 try/except 忽略已存在
+            for ddl in (
+                "CREATE INDEX idx_file_fuid_bot ON file_mappings(bot_db_id, file_unique_id)",
+                "CREATE INDEX idx_file_created_bot ON file_mappings(bot_db_id, created_at)",
+            ):
+                try:
+                    await conn.execute(text(ddl))
+                except Exception:
+                    pass  # 索引已存在
 
     logger.info("数据库初始化完成 (type=%s)", DB_TYPE)
 

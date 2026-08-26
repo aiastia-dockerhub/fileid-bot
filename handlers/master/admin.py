@@ -2,6 +2,8 @@
 import io
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime
 from senders import _retry_send
 
@@ -14,9 +16,11 @@ from db import (
     update_user_bot_status,
     get_all_owner_ids,
     get_platform_stats,
-    get_platform_bot_details, get_platform_export_data,
-    get_active_bot_files,
-    get_files_by_bot_db_id,
+    get_platform_bot_details,
+    stream_files_by_bot_db_id,
+    stream_active_bot_files,
+    stream_export_bots, stream_export_files, stream_export_collections,
+    stream_export_blacklist,
     get_blacklist_count,
     get_platform_setting, set_platform_setting,
     update_user_vip, get_user_vip_info,
@@ -120,6 +124,45 @@ async def platform_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ==================== 导出功能 ====================
 
+def _new_export_file(suffix: str) -> str:
+    """创建导出用临时文件路径"""
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix="export_")
+    os.close(fd)
+    return path
+
+
+async def _send_export_file(context, update, status_msg, tmp_path: str,
+                            filename: str, caption: str):
+    """发送导出的临时文件并清理"""
+    try:
+        with open(tmp_path, 'rb') as f:
+            await _retry_send(context.bot.send_document,
+                chat_id=update.message.chat_id,
+                document=f,
+                filename=filename,
+                caption=caption,
+            )
+        await status_msg.delete()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+async def _write_json_array(f, agen) -> int:
+    """将异步生成器的条目增量写入 JSON 数组（避免全量构造大 list），返回条目数"""
+    count = 0
+    f.write('[')
+    async for item in agen:
+        if count:
+            f.write(', ')
+        f.write(json.dumps(item, ensure_ascii=False, default=str))
+        count += 1
+    f.write(']')
+    return count
+
+
 async def export_data_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/export 管理员导出数据 - 支持指定Bot导出CSV文件代码"""
     from config import ADMIN_IDS
@@ -135,6 +178,7 @@ async def export_data_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         export_arg = args[1].strip().lstrip('@')
         status_msg = await _retry_send(update.message.reply_text, "⏳ 正在导出 TXT...")
 
+        tmp_path = None
         try:
             bot_record = None
             try:
@@ -148,30 +192,32 @@ async def export_data_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
             bot_db_id_export = bot_record['id']
             bot_username = bot_record['bot_username']
-            files = await get_files_by_bot_db_id(bot_db_id_export)
-            if not files:
+
+            # 流式导出：边查边写临时文件，避免全量载入内存
+            tmp_path = _new_export_file(".txt")
+            count = 0
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                async for row in stream_files_by_bot_db_id(bot_db_id_export):
+                    f.write(f"{row['code']}\n")
+                    count += 1
+            if count == 0:
                 await status_msg.edit_text(f"📭 Bot @{escape(bot_username)} (ID:{bot_db_id_export}) 没有文件记录。")
                 return
 
-            # 生成纯文本（每行一个code）
-            output = io.StringIO()
-            for f in files:
-                output.write(f"{f['code']}\n")
-            export_text = output.getvalue()
             filename = f"{bot_username}_{bot_db_id_export}_codes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-
-            bytes_io = io.BytesIO(export_text.encode('utf-8'))
-            await _retry_send(context.bot.send_document, 
-                chat_id=update.message.chat_id,
-                document=bytes_io,
-                filename=filename,
-                caption=f"📄 @{escape(bot_username)} (ID:{bot_db_id_export}) 纯文本 code 导出，共 {len(files)} 条。",
-            )
-            await status_msg.delete()
-            logger.info("管理员 %s 导出了 Bot @%s (ID:%d) 的 TXT code (%d 条)", user_id, bot_username, bot_db_id_export, len(files))
+            await _send_export_file(context, update, status_msg, tmp_path, filename,
+                f"📄 @{escape(bot_username)} (ID:{bot_db_id_export}) 纯文本 code 导出，共 {count} 条。")
+            tmp_path = None  # 已发送并清理
+            logger.info("管理员 %s 导出了 Bot @%s (ID:%d) 的 TXT code (%d 条)", user_id, bot_username, bot_db_id_export, count)
         except Exception as e:
             await status_msg.edit_text(f"❌ 导出失败: {escape(str(e))}")
             logger.error("导出Bot TXT数据失败: %s", e, exc_info=True)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
         return
 
     # /export <bot_username|db_id> — 导出指定Bot的文件代码CSV（支持同名Bot）
@@ -179,6 +225,7 @@ async def export_data_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         export_arg = args[0].strip().lstrip('@')
         status_msg = await _retry_send(update.message.reply_text, "⏳ 正在导出...")
 
+        tmp_path = None
         try:
             bot_record = None
             try:
@@ -192,31 +239,33 @@ async def export_data_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
             bot_db_id_export = bot_record['id']
             bot_username = bot_record['bot_username']
-            files = await get_files_by_bot_db_id(bot_db_id_export)
-            if not files:
+
+            # 流式导出：边查边写临时文件，避免全量载入内存
+            tmp_path = _new_export_file(".csv")
+            count = 0
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write("code,file_type,file_size,user_id,created_at\n")
+                async for row in stream_files_by_bot_db_id(bot_db_id_export):
+                    f.write(f"{row['code']},{row['file_type']},{row['file_size']},{row['user_id']},{row['created_at']}\n")
+                    count += 1
+            if count == 0:
                 await status_msg.edit_text(f"📭 Bot @{escape(bot_username)} (ID:{bot_db_id_export}) 没有文件记录。")
                 return
 
-            # 生成CSV（逗号分隔）
-            output = io.StringIO()
-            output.write("code,file_type,file_size,user_id,created_at\n")
-            for f in files:
-                output.write(f"{f['code']},{f['file_type']},{f['file_size']},{f['user_id']},{f['created_at']}\n")
-            export_text = output.getvalue()
             filename = f"{bot_username}_{bot_db_id_export}_files_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-
-            bytes_io = io.BytesIO(export_text.encode('utf-8'))
-            await _retry_send(context.bot.send_document, 
-                chat_id=update.message.chat_id,
-                document=bytes_io,
-                filename=filename,
-                caption=f"📁 @{escape(bot_username)} (ID:{bot_db_id_export}) 文件代码导出，共 {len(files)} 条记录。",
-            )
-            await status_msg.delete()
-            logger.info("管理员 %s 导出了 Bot @%s (ID:%d) 的文件代码 (%d 条)", user_id, bot_username, bot_db_id_export, len(files))
+            await _send_export_file(context, update, status_msg, tmp_path, filename,
+                f"📁 @{escape(bot_username)} (ID:{bot_db_id_export}) 文件代码导出，共 {count} 条记录。")
+            tmp_path = None  # 已发送并清理
+            logger.info("管理员 %s 导出了 Bot @%s (ID:%d) 的文件代码 (%d 条)", user_id, bot_username, bot_db_id_export, count)
         except Exception as e:
             await status_msg.edit_text(f"❌ 导出失败: {escape(str(e))}")
             logger.error("导出Bot数据失败: %s", e, exc_info=True)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
         return
 
     # 无参数或 help 显示帮助
@@ -237,39 +286,54 @@ async def export_data_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     status_msg = await _retry_send(update.message.reply_text, "⏳ 正在准备导出数据...")
 
+    tmp_path = None
     try:
-        data = await get_platform_export_data()
-
+        # 全部改为流式导出：边查边写临时文件，避免全表 fetchall 造成内存尖峰
         if export_format in ('json', 'code'):
-            export_text = json.dumps(data, ensure_ascii=False, indent=2)
+            tmp_path = _new_export_file(".json")
+            counts = {}
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write('{')
+                f.write('"bots": ')
+                counts['bots'] = await _write_json_array(f, stream_export_bots())
+                f.write(', "files": ')
+                counts['files'] = await _write_json_array(f, stream_export_files())
+                f.write(', "collections": ')
+                counts['collections'] = await _write_json_array(f, stream_export_collections())
+                f.write(', "blacklist": ')
+                counts['blacklist'] = await _write_json_array(f, stream_export_blacklist())
+                f.write('}')
             filename = f"platform_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
             caption = (
                 f"📊 平台数据导出\n\n"
-                f"🤖 Bot: {len(data['bots'])} 个\n"
-                f"📁 文件: {len(data['files'])} 条\n"
-                f"📦 集合: {len(data['collections'])} 个\n"
-                f"🚫 黑名单: {len(data['blacklist'])} 人"
+                f"🤖 Bot: {counts['bots']} 个\n"
+                f"📁 文件: {counts['files']} 条\n"
+                f"📦 集合: {counts['collections']} 个\n"
+                f"🚫 黑名单: {counts['blacklist']} 人"
             )
         elif export_format == 'csv':
             # 支持日期参数: /export csv 2026-05-05
             since_date = args[1] if len(args) > 1 else None
-            files = await get_active_bot_files(since_date)
-            output = io.StringIO()
-            output.write("code,bot_username,file_type,file_size,user_id,created_at\n")
-            for f in files:
-                output.write(f"{f['code']},{f['bot_username']},{f['file_type']},{f['file_size']},{f['user_id']},{f['created_at']}\n")
-            export_text = output.getvalue()
+            tmp_path = _new_export_file(".csv")
+            count = 0
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write("code,bot_username,file_type,file_size,user_id,created_at\n")
+                async for row in stream_active_bot_files(since_date):
+                    f.write(f"{row['code']},{row['bot_username']},{row['file_type']},{row['file_size']},{row['user_id']},{row['created_at']}\n")
+                    count += 1
             date_info = f"（{since_date} 起）" if since_date else ""
             filename = f"active_files_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            caption = f"📁 活跃Bot文件导出{date_info}，共 {len(files)} 条记录。"
+            caption = f"📁 活跃Bot文件导出{date_info}，共 {count} 条记录。"
         elif export_format == 'bots':
-            output = io.StringIO()
-            output.write("id,owner_id,bot_id,bot_username,bot_firstname,status,created_at\n")
-            for b in data['bots']:
-                output.write(f"{b['id']},{b['owner_id']},{b['bot_id']},{b['bot_username']},{b['bot_firstname']},{b['status']},{b['created_at']}\n")
-            export_text = output.getvalue()
+            tmp_path = _new_export_file(".csv")
+            count = 0
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write("id,owner_id,bot_id,bot_username,bot_firstname,status,created_at\n")
+                async for b in stream_export_bots():
+                    f.write(f"{b['id']},{b['owner_id']},{b['bot_id']},{b['bot_username']},{b['bot_firstname']},{b['status']},{b['created_at']}\n")
+                    count += 1
             filename = f"bots_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            caption = f"🤖 Bot 列表导出，共 {len(data['bots'])} 条记录。"
+            caption = f"🤖 Bot 列表导出，共 {count} 条记录。"
         else:
             await status_msg.edit_text(
                 "❓ 未知格式。\n\n"
@@ -282,18 +346,18 @@ async def export_data_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return
 
-        bytes_io = io.BytesIO(export_text.encode('utf-8'))
-        await _retry_send(context.bot.send_document, 
-            chat_id=update.message.chat_id,
-            document=bytes_io,
-            filename=filename,
-            caption=caption,
-        )
-        await status_msg.delete()
+        await _send_export_file(context, update, status_msg, tmp_path, filename, caption)
+        tmp_path = None  # 已发送并清理
         logger.info("管理员 %s 导出了平台数据 (格式: %s)", user_id, export_format)
     except Exception as e:
         await status_msg.edit_text(f"❌ 导出失败: {escape(str(e))}")
         logger.error("导出数据失败: %s", e, exc_info=True)
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # ==================== 管理员重启/启动Bot ====================
@@ -555,10 +619,13 @@ async def _broadcast_via_user_bots(update: Update, context: ContextTypes.DEFAULT
         for bot_db_id, app in apps.items():
             bot_username = app.bot.username if app.bot else f"Bot#{bot_db_id}"
 
-            bot_record = await get_user_bot_by_id(bot_db_id)
-            if not bot_record:
-                bot_results.append(f"❓ @{escape(bot_username)}: 未找到记录")
-                continue
+            # 优先用内存中的 bot_record（启动时已加载），避免每个 Bot 查一次 DB
+            bot_record = app.bot_data.get('bot_record') or {}
+            if not bot_record.get('owner_id'):
+                bot_record = await get_user_bot_by_id(bot_db_id)
+                if not bot_record:
+                    bot_results.append(f"❓ @{escape(bot_username)}: 未找到记录")
+                    continue
 
             owner_id = bot_record['owner_id']
 

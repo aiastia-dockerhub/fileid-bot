@@ -117,6 +117,10 @@ class BotManager:
             ApplicationBuilder()
             .token(token)
             .concurrent_updates(True)
+            # PTB 默认连接池上限 256；webhook 模式下每 Bot 并发由
+            # PER_BOT_CONCURRENCY 信号量+发送队列控制，16 足够，
+            # 54+ Bot 时可显著降低每 Bot 的 httpx 资源占用
+            .connection_pool_size(16)
             .read_timeout(API_READ_TIMEOUT)
             .write_timeout(API_WRITE_TIMEOUT)
             .connect_timeout(API_CONNECT_TIMEOUT)
@@ -333,6 +337,13 @@ class BotManager:
         if not app:
             return False
 
+        # 记录用户名，停止后用于清理该 Bot 的发送队列/限速状态
+        bot_username = None
+        try:
+            bot_username = app.bot.username
+        except Exception:
+            pass
+
         try:
             if BOT_MODE == 'webhook':
                 # Webhook 模式：删除 webhook 再关闭
@@ -349,6 +360,22 @@ class BotManager:
         except Exception as e:
             logger.error("停止用户Bot失败: %s", e)
             return False
+        finally:
+            # 清理该 Bot 的发送队列与限速状态：
+            # 队列消费者协程和 _bot 会强引用已停止的 Application/HTTPX 连接池，
+            # 不清理会随 Bot 增删累积内存
+            if bot_username:
+                try:
+                    from send_queue import stop_queue
+                    await stop_queue(bot_username)
+                except Exception as e:
+                    logger.warning("清理发送队列失败 (@%s): %s", bot_username, e)
+                try:
+                    from senders import _rate_limiter
+                    _rate_limiter.remove(f'@{bot_username}')
+                except Exception as e:
+                    logger.warning("清理限速器失败 (@%s): %s", bot_username, e)
+            self._bot_semaphores.pop(bot_db_id, None)
 
     def _get_semaphore(self, bot_db_id: int) -> asyncio.Semaphore:
         """获取或创建每个 Bot 的并发信号量"""
@@ -397,6 +424,7 @@ class BotManager:
     async def load_all(self) -> int:
         """从数据库加载所有活跃的用户Bot（限制并发数启动）"""
         self._loading = True
+        loaded = 0
         try:
             bots = await get_all_active_user_bots()
             logger.info("从数据库加载 %d 个用户Bot（最大并发 %d）", len(bots), MAX_CONCURRENT_STARTS)

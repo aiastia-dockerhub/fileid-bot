@@ -191,11 +191,32 @@ def _run_webhook_server(application: Application, bot_manager: BotManager,
     webhook_handler = _build_webhook_handler(application, bot_manager)
 
     async def health_handler(request: web.Request):
+        # 内存/队列诊断：便于排查内存增长（RSS 单位换算：Linux KB / macOS bytes）
+        import resource
+        import sys as _sys
+        from send_queue import _queues
+        maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_mb = maxrss / (1024 * 1024) if _sys.platform == 'darwin' else maxrss / 1024
+
+        # 占用 user_data 最多的 5 个 Bot（定位内存大户）
+        top_user_data = []
+        try:
+            sizes = sorted(
+                ((len(app.user_data), bid) for bid, app in bot_manager.get_all_apps().items()),
+                reverse=True,
+            )[:5]
+            top_user_data = [{"bot_db_id": bid, "user_data": n} for n, bid in sizes]
+        except Exception:
+            pass
+
         return web.json_response({
             "status": "ok",
             "role": role,
             "mode": "webhook",
             "bots": bot_manager.active_count,
+            "send_queues": len(_queues),
+            "rss_mb": round(rss_mb, 1),
+            "top_user_data": top_user_data,
         })
 
     web_app = web.Application()
