@@ -1016,6 +1016,55 @@ async def set_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _retry_send(update.message.reply_text, "❌ 设置失败，用户可能不存在。")
 
 
+# ==================== 管理员帮助 ====================
+
+async def help_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/helpadmin 管理员命令帮助（仅管理员可见）"""
+    from config import ADMIN_IDS, VIP_PLANS, BASIC_LEVEL
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await _retry_send(update.message.reply_text, "⛔ 此命令仅限管理员使用。")
+        return
+
+    basic = VIP_PLANS[BASIC_LEVEL]
+    text = (
+        "🛠 <b>管理员命令帮助</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "👑 <b>会员管理</b>\n"
+        "• <code>/setvip USER_ID LEVEL [MONTHS]</code> — 设置会员\n"
+        "  等级 0-4（4=基础版），默认 12 个月；<code>0</code> 取消会员\n"
+        "• <code>/setvip info USER_ID</code> — 查询用户会员\n"
+        "• <code>/setvip list</code> — 付费会员列表（名字/ID/到期/Bot）\n"
+        "• <code>/setfree</code> — 免费注册管理面板\n"
+        "  <code>close</code> 关闭免费注册（新用户需购基础版 "
+        f"{basic['monthly_price']}⭐/月，存量免费用户保留）\n"
+        "  <code>open</code> 恢复免费注册\n"
+        "  <code>limit N</code> 免费用户名额上限（0=不限）\n"
+        "  <code>files N</code> 免费用户 Bot 文件上限（默认 20,000）\n"
+        "  <code>basicfiles N</code> 基础版 Bot 文件上限（默认 50,000）\n"
+        "  💡 VIP 不限文件数；超限文件仍入库但不返回代码\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🤖 <b>Bot / 平台管理</b>\n"
+        "• <code>/platform [bots|bots all]</code> — 平台统计 / Bot 详情\n"
+        "• <code>/startbot @用户名|数据库ID</code> — 启动/重启 Bot\n"
+        "• <code>/stopbot @用户名|数据库ID</code> — 停止 Bot\n"
+        "• <code>/blacklist</code> — 黑名单管理\n"
+        "• <code>/broadcast user 消息内容</code> — 广播消息\n"
+        "• <code>/export</code> — 导出数据\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "💎 <b>星星资产 / 其他</b>\n"
+        "• <code>/mystars</code> — 星星余额 / 发礼物 / 赠 Premium / 领取码\n"
+        "• <code>/setgroup add|del|clear</code> — 用户 Bot 沟通群组\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🔄 <b>会员迁移（用户自助，无需管理员操作）</b>\n"
+        "用户在 /vip 点「迁移会员」生成迁移码，新账号发 "
+        "<code>/start mig_码</code> 领取。\n"
+        "剩余时长原样搬运、有效期=会员剩余期。\n"
+        "通过迁移收到的会员不能再迁出；重新购买或管理员重新授予后重置，可再迁移一次。"
+    )
+    await _retry_send(update.message.reply_text, text, parse_mode="HTML")
+
+
 # ==================== 管理员管理免费注册/名额 ====================
 
 async def set_free_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

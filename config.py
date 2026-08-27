@@ -126,7 +126,8 @@ FILE_TYPE_MAP = {
 }
 
 # ===== 主 Bot 快捷命令列表 =====
-MASTER_BOT_COMMANDS = [
+# 普通用户菜单可见
+MASTER_USER_COMMANDS = [
     ("start", "开始使用 / 查看帮助"),
     ("vip", "VIP 会员 / 购买星星"),
     ("premium", "购买 Telegram Premium 会员"),
@@ -136,15 +137,24 @@ MASTER_BOT_COMMANDS = [
     ("delbot", "删除 Bot"),
     ("botstatus", "查看 Bot 运行状态"),
     ("updatetoken", "更新失效的 Token"),
-    ("mystars", "星星资产 / 发送礼物 / 赠送 Premium 会员（管理员）"),
-    ("setfree", "免费注册/名额管理（管理员）"),
-    ("platform", "平台统计（管理员）"),
-    ("blacklist", "黑名单管理（管理员）"),
-    ("export", "导出数据（管理员）"),
-    ("broadcast", "广播消息（管理员）"),
-    ("startbot", "重启/启动Bot（管理员）"),
-    ("stopbot", "停止指定Bot（管理员）"),
 ]
+
+# 管理员专属（仅管理员的命令菜单可见，普通用户菜单不显示）
+MASTER_ADMIN_COMMANDS = [
+    ("helpadmin", "管理员命令帮助"),
+    ("setvip", "会员管理：设置/查询/列表"),
+    ("setfree", "免费注册/名额/文件额度管理"),
+    ("mystars", "星星资产 / 礼物 / Premium 代充"),
+    ("setgroup", "用户 Bot 沟通群组管理"),
+    ("platform", "平台统计"),
+    ("blacklist", "黑名单管理"),
+    ("export", "导出数据"),
+    ("broadcast", "广播消息"),
+    ("startbot", "重启/启动Bot"),
+    ("stopbot", "停止指定Bot"),
+]
+
+MASTER_BOT_COMMANDS = MASTER_USER_COMMANDS + MASTER_ADMIN_COMMANDS
 
 # ===== 用户子 Bot 快捷命令列表 =====
 USER_BOT_COMMANDS = [

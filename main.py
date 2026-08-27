@@ -21,7 +21,6 @@ from config import (
     API_READ_TIMEOUT, API_WRITE_TIMEOUT, API_CONNECT_TIMEOUT,
     BOT_MODE, WEBHOOK_HOST, WEBHOOK_PATH, WEBHOOK_PORT, WEBHOOK_SECRET,
     ROLE, WORKER_SECRET, REDIS_URL, LOG_LEVEL,
-    MASTER_BOT_COMMANDS,
 )
 from db import init_db
 from bot_manager import BotManager
@@ -50,9 +49,20 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def post_init(application: Application) -> None:
     """主Bot初始化完成后：设置命令、加载所有用户Bot"""
-    # 注册主Bot命令
+    # 注册主Bot命令：默认菜单只显示用户命令；
+    # 管理员私聊菜单额外显示管理命令（BotCommandScopeChat 需管理员与 Bot 有过会话，失败忽略）
     try:
-        await application.bot.set_my_commands(MASTER_BOT_COMMANDS)
+        from telegram import BotCommandScopeChat
+        from config import MASTER_USER_COMMANDS, MASTER_ADMIN_COMMANDS
+        await application.bot.set_my_commands(MASTER_USER_COMMANDS)
+        for admin_id in ADMIN_IDS:
+            try:
+                await application.bot.set_my_commands(
+                    MASTER_USER_COMMANDS + MASTER_ADMIN_COMMANDS,
+                    scope=BotCommandScopeChat(admin_id),
+                )
+            except Exception:
+                pass  # 管理员尚未与 Bot 交互过时设置 chat scope 会失败
     except Exception as e:
         logger.warning("主Bot注册命令失败: %s", e)
 
@@ -233,7 +243,7 @@ def _register_master_handlers(application: Application):
         platform_stats_cmd, blacklist_cmd, export_data_cmd,
         start_bot_admin_cmd, stop_bot_admin_cmd,
         broadcast_cmd, set_group_cmd,
-        set_vip_cmd, set_free_cmd,
+        set_vip_cmd, set_free_cmd, help_admin_cmd,
         restart_bot_callback,
         update_token_callback, update_token_cmd,
         blacklist_check_handler,
@@ -284,6 +294,7 @@ def _register_master_handlers(application: Application):
     application.add_handler(CommandHandler("setgroup", set_group_cmd))
     application.add_handler(CommandHandler("setvip", set_vip_cmd))
     application.add_handler(CommandHandler("setfree", set_free_cmd))
+    application.add_handler(CommandHandler("helpadmin", help_admin_cmd))
 
     # VIP 转发保护设置（Bot 主人设置转发模式）
     from handlers.master.manage import forward_mode_callback, auto_delete_callback
