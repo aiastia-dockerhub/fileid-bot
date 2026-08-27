@@ -822,7 +822,8 @@ async def set_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "  0 = 普通用户\n"
             "  1 = VIP 1\n"
             "  2 = VIP 2\n"
-            "  3 = VIP 3\n\n"
+            "  3 = VIP 3\n"
+            "  4 = 基础版\n\n"
             "默认有效期 12 个月。 Months=0 表示永久。",
             parse_mode="HTML"
         )
@@ -872,11 +873,11 @@ async def set_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         level = int(args[1])
     except ValueError:
-        await _retry_send(update.message.reply_text, "❌ VIP等级必须是数字 (0-3)。")
+        await _retry_send(update.message.reply_text, "❌ VIP等级必须是数字 (0-4)。")
         return
 
-    if level < 0 or level > 3:
-        await _retry_send(update.message.reply_text, "❌ VIP等级范围: 0-3。")
+    if level < 0 or level > 4:
+        await _retry_send(update.message.reply_text, "❌ VIP等级范围: 0-4。")
         return
 
     months = int(args[2]) if len(args) > 2 else 12
@@ -898,7 +899,7 @@ async def set_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     success = await update_user_vip(target_id, level, months)
     if success:
         info = await get_user_vip_info(target_id)
-        level_names = {1: 'VIP 1', 2: 'VIP 2', 3: 'VIP 3'}
+        level_names = {1: 'VIP 1', 2: 'VIP 2', 3: 'VIP 3', 4: '基础版'}
         await _retry_send(update.message.reply_text,
             f"✅ <b>VIP 设置成功</b>\n\n"
             f"👤 User ID: <code>{target_id}</code>\n"
@@ -911,3 +912,107 @@ async def set_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.info("管理员 %s 设置用户 %s 为 VIP%d (%d个月)", user_id, target_id, level, months)
     else:
         await _retry_send(update.message.reply_text, "❌ 设置失败，用户可能不存在。")
+
+
+# ==================== 管理员管理免费注册/名额 ====================
+
+async def set_free_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/setfree 管理员管理免费注册开关和免费用户名额
+
+    用法：
+        /setfree               — 查看当前状态
+        /setfree close         — 关闭免费注册（新用户需购买基础版 10⭐/月，存量免费用户保留）
+        /setfree open          — 恢复免费注册
+        /setfree limit N       — 免费用户数量上限（0=不限制；未设置时用环境变量 MAX_VIP0_USERS）
+    """
+    from config import ADMIN_IDS, VIP_PLANS, BASIC_LEVEL
+    from db.vip import (
+        is_free_registration_closed, get_max_vip0_users_limit,
+        invalidate_free_settings_cache, get_vip0_user_count,
+    )
+
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await _retry_send(update.message.reply_text, "⛔ 此命令仅限管理员使用。")
+        return
+
+    args = context.args or []
+    basic = VIP_PLANS[BASIC_LEVEL]
+
+    if not args:
+        closed = await is_free_registration_closed()
+        limit = await get_max_vip0_users_limit()
+        count = await get_vip0_user_count()
+        limit_text = "不限制" if limit <= 0 else str(limit)
+
+        text = (
+            f"🆓 <b>免费注册管理</b>\n\n"
+            f"📌 免费注册：{'🚫 已关闭（新用户需购买基础版）' if closed else '✅ 开放中'}\n"
+            f"💎 基础版价格：月付 {basic['monthly_price']}⭐ / 年付 {basic['yearly_price']}⭐（{basic['max_bots']} 个 Bot）\n"
+            f"📊 免费用户上限：{limit_text}\n"
+            f"👥 当前免费占用名额：{count}\n\n"
+            f"<b>用法：</b>\n"
+            f"• <code>/setfree close</code> — 关闭免费注册\n"
+            f"• <code>/setfree open</code> — 恢复免费注册\n"
+            f"• <code>/setfree limit N</code> — 设置上限（0=不限制）\n\n"
+            f"💡 关闭免费注册后，存量免费用户不受影响；免费开放期间不出售基础版。"
+        )
+        await _retry_send(update.message.reply_text, text, parse_mode="HTML")
+        return
+
+    action = args[0].lower()
+
+    if action == 'close':
+        await set_platform_setting('free_registration', 'closed')
+        await invalidate_free_settings_cache()
+        await _retry_send(update.message.reply_text,
+            "✅ 已关闭免费注册。\n\n"
+            "• 新用户需购买基础版或 VIP 才能创建 Bot\n"
+            "• 存量免费用户（已有 Bot）不受影响\n"
+            "• /vip 页面将展示基础版购买入口"
+        )
+        logger.info("管理员 %s 关闭了免费注册", user_id)
+
+    elif action == 'open':
+        await set_platform_setting('free_registration', 'open')
+        await invalidate_free_settings_cache()
+        await _retry_send(update.message.reply_text,
+            "✅ 已恢复免费注册。\n\n"
+            "• 基础版停止出售（已购买的基础版用户不受影响，到期后 Bot 暂停）"
+        )
+        logger.info("管理员 %s 恢复了免费注册", user_id)
+
+    elif action == 'limit':
+        if len(args) < 2:
+            await _retry_send(update.message.reply_text,
+                "❌ 请指定数量。\n用法：<code>/setfree limit N</code>（0=不限制）",
+                parse_mode="HTML"
+            )
+            return
+        try:
+            n = int(args[1])
+        except ValueError:
+            await _retry_send(update.message.reply_text, "❌ 数量必须是数字。")
+            return
+        if n < 0:
+            await _retry_send(update.message.reply_text, "❌ 数量不能为负数。")
+            return
+
+        await set_platform_setting('max_vip0_users', str(n))
+        await invalidate_free_settings_cache()
+        limit_text = "不限制" if n == 0 else f"{n} 个"
+        count = await get_vip0_user_count()
+        await _retry_send(update.message.reply_text,
+            f"✅ 免费用户上限已设置为 {limit_text}。\n"
+            f"当前免费占用名额：{count}"
+        )
+        logger.info("管理员 %s 设置免费用户上限为 %d", user_id, n)
+
+    else:
+        await _retry_send(update.message.reply_text,
+            "❓ 未知操作。\n\n"
+            "• <code>/setfree close</code> — 关闭免费注册\n"
+            "• <code>/setfree open</code> — 恢复免费注册\n"
+            "• <code>/setfree limit N</code> — 设置免费用户上限",
+            parse_mode="HTML"
+        )

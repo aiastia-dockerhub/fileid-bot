@@ -8,7 +8,8 @@ from sqlalchemy import select, update, func, text
 
 from db.core import get_session, _model_to_dict
 from db.models import User, StarPayment, UserBot, UserBotPref
-from config import VIP_PLANS, VIP_FEATURES, MAX_VIP0_USERS
+from db.bots import get_platform_setting
+from config import VIP_PLANS, VIP_FEATURES, MAX_VIP0_USERS, BASIC_LEVEL
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,52 @@ async def _get_redis():
     """延迟导入获取 Redis 实例"""
     from redis_manager import get_redis
     return await get_redis()
+
+
+# ==================== 免费注册运行时设置 ====================
+# 存 platform_settings 表，管理员用 /setfree 命令随时切换，无需重启。
+# 读取走 Redis 缓存（30s），/setfree 修改时主动失效。
+
+_SETTING_CACHE_TTL = 30
+
+
+async def is_free_registration_closed() -> bool:
+    """免费注册是否已关闭（关闭后新用户需购买基础版 10⭐/月）"""
+    r = await _get_redis()
+    cached = await r.cache_get("setting:free_registration")
+    if cached is not None:
+        return cached == "closed"
+
+    value = await get_platform_setting("free_registration", "")
+    closed = value == "closed"
+    await r.cache_set("setting:free_registration", "closed" if closed else "open", ttl=_SETTING_CACHE_TTL)
+    return closed
+
+
+async def get_max_vip0_users_limit() -> int:
+    """免费用户数量上限：优先运行时设置（/setfree limit），未设置回退环境变量 MAX_VIP0_USERS"""
+    r = await _get_redis()
+    cached = await r.cache_get("setting:max_vip0_users")
+    if cached is not None:
+        try:
+            return int(cached)
+        except ValueError:
+            pass
+
+    value = await get_platform_setting("max_vip0_users", "")
+    try:
+        limit = int(value) if value else MAX_VIP0_USERS
+    except ValueError:
+        limit = MAX_VIP0_USERS
+    await r.cache_set("setting:max_vip0_users", str(limit), ttl=_SETTING_CACHE_TTL)
+    return limit
+
+
+async def invalidate_free_settings_cache() -> None:
+    """清除免费注册设置缓存（/setfree 修改后调用，立即生效）"""
+    r = await _get_redis()
+    await r.cache_delete("setting:free_registration")
+    await r.cache_delete("setting:max_vip0_users")
 
 
 async def get_or_create_user(user_id: int) -> Dict:
@@ -62,9 +109,14 @@ async def get_user_vip_level(user_id: int) -> int:
         try:
             expire_dt = datetime.strptime(expire_at, "%Y-%m-%d %H:%M:%S")
             if datetime.now() > expire_dt:
-                # VIP 已过期，降回 0
-                await _downgrade_expired_user(user_id)
-                level = 0
+                if level == BASIC_LEVEL:
+                    # 基础版过期不降级：保持 level 4 + 过期时间，
+                    # 与存量免费用户（level 0 无到期）区分开，由 max_bots=0 挡住使用
+                    pass
+                else:
+                    # VIP 已过期，降回 0
+                    await _downgrade_expired_user(user_id)
+                    level = 0
         except ValueError:
             pass
 
@@ -109,10 +161,11 @@ async def get_user_vip_info(user_id: int) -> Dict:
 
 
 async def get_max_bots_for_user(user_id: int) -> int:
-    """获取用户可创建的最大Bot数量"""
-    level = await get_user_vip_level(user_id)
-    plan = VIP_PLANS.get(level, VIP_PLANS[0])
-    return plan['max_bots']
+    """获取用户可创建的最大Bot数量（基础版已过期返回 0，续费/升级后恢复）"""
+    info = await get_user_vip_info(user_id)
+    if info['vip_level'] == BASIC_LEVEL and not info['is_active']:
+        return 0
+    return VIP_PLANS.get(info['vip_level'], VIP_PLANS[0])['max_bots']
 
 
 async def update_user_vip(user_id: int, level: int, months: int) -> bool:
@@ -310,34 +363,48 @@ async def resume_user_bot(bot_db_id: int) -> bool:
 
 
 async def get_vip0_user_count() -> int:
-    """获取当前 VIP 0（免费）用户数量（有 Bot 的用户）"""
+    """获取当前免费（VIP 0）用户数量（有 Bot 的才算占用名额，VIP/基础版用户不占）"""
     async with get_session() as session:
         result = await session.execute(
-            select(func.count(func.distinct(UserBot.owner_id))).select_from(UserBot)
-            .where(UserBot.status != 'deleted')
+            select(func.count(func.distinct(UserBot.owner_id)))
+            .select_from(UserBot)
+            .outerjoin(User, UserBot.owner_id == User.user_id)
+            .where(
+                UserBot.status != 'deleted',
+                func.coalesce(User.vip_level, 0) == 0,
+            )
         )
         return result.scalar() or 0
 
 
 async def check_vip0_capacity(user_id: int) -> bool:
-    """检查 VIP 0 用户是否还能创建 Bot（受 MAX_VIP0_USERS 限制）
-    返回 True 表示可以创建，False 表示已满
-    已有 Bot 的老用户不受此限制
+    """检查用户是否还能免费创建 Bot（统一闸门：免费注册开关 + 名额上限）
+    返回 True 表示可以创建，False 表示被拦
+    规则：
+    - VIP / 基础版用户不受限制（基础版过期由 max_bots=0 挡住）
+    - 已有 Bot 的存量免费用户不受限制（老用户保留）
+    - 免费注册关闭后，拦住无 Bot 的新用户
+    - 免费注册开放时，受免费用户数量上限限制（运行时设置 /setfree limit，回退 env）
     """
-    if MAX_VIP0_USERS <= 0:
-        return True  # 不限制
-
     level = await get_user_vip_level(user_id)
     if level > 0:
-        return True  # VIP 用户不受此限制
+        return True  # VIP / 基础版用户不受此限制
 
     # 已有 Bot 的用户不受限制（已占用名额，允许在其 max_bots 内继续操作）
     existing_bots = await get_active_bots_count_by_owner(user_id)
     if existing_bots > 0:
         return True
 
+    # 免费注册已关闭：新用户需购买基础版（10⭐/月）或 VIP
+    if await is_free_registration_closed():
+        return False
+
+    limit = await get_max_vip0_users_limit()
+    if limit <= 0:
+        return True  # 不限制
+
     count = await get_vip0_user_count()
-    return count < MAX_VIP0_USERS
+    return count < limit
 
 
 async def get_paused_bots_by_owner(owner_id: int) -> List[Dict]:

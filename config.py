@@ -72,20 +72,26 @@ ALLOW_GROUP = os.environ.get('ALLOW_GROUP', 'false').lower() in ('true', '1', 'y
 # ===== VIP 等级配置 =====
 # VIP等级: {level: {name, max_bots, monthly_price, yearly_price}}
 # VIP 0 使用 MAX_BOTS_PER_USER，VIP 1-3 可通过 VIP1_MAX_BOTS 等环境变量配置
+# 基础版（BASIC_LEVEL=4）：权益与免费一致，仅在「免费注册关闭」时作为付费入口（10⭐/月）
 VIP_PLANS = {
     0: {'name': '免费用户', 'max_bots': int(os.environ.get('MAX_BOTS_PER_USER', '1')), 'monthly_price': 0, 'yearly_price': 0},
     1: {'name': 'VIP 1', 'max_bots': int(os.environ.get('VIP1_MAX_BOTS', os.environ.get('MAX_BOTS_PER_USER', '1'))), 'monthly_price': 100, 'yearly_price': 1000},
     2: {'name': 'VIP 2', 'max_bots': int(os.environ.get('VIP2_MAX_BOTS', '3')), 'monthly_price': 150, 'yearly_price': 1500},
     3: {'name': 'VIP 3', 'max_bots': int(os.environ.get('VIP3_MAX_BOTS', '6')), 'monthly_price': 500, 'yearly_price': 5000},
+    4: {'name': '基础版', 'max_bots': int(os.environ.get('MAX_BOTS_PER_USER', '1')), 'monthly_price': 10, 'yearly_price': 100},
 }
 
+# 基础版等级号（过期后不降级回 0，保持 level 4 + 过期时间，max_bots 视为 0）
+BASIC_LEVEL = 4
+
 # VIP 特权功能（高等级包含低等级所有特权）
-# forward_mode: Bot 主人可控制发送的图片/视频是否允许转发 (VIP 1+)
+# forward_mode: Bot 主人可控制发送的图片/视频是否允许转发 (VIP 1+，基础版不含)
 VIP_FEATURES = {
     0: {'forward_mode': False},
     1: {'forward_mode': True},
     2: {'forward_mode': True},
     3: {'forward_mode': True},
+    4: {'forward_mode': False},
 }
 
 # 转发模式常量（整数）
@@ -126,6 +132,7 @@ MASTER_BOT_COMMANDS = [
     ("botstatus", "查看 Bot 运行状态"),
     ("updatetoken", "更新失效的 Token"),
     ("mystars", "星星资产 / 发送礼物 / 赠送 Premium 会员（管理员）"),
+    ("setfree", "免费注册/名额管理（管理员）"),
     ("platform", "平台统计（管理员）"),
     ("blacklist", "黑名单管理（管理员）"),
     ("export", "导出数据（管理员）"),

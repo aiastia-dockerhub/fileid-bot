@@ -13,7 +13,7 @@ from db import (
     get_user_bot_by_id, is_bot_admin_stopped,
 )
 from db.vip import get_max_bots_for_user, check_vip0_capacity
-from handlers.master._utils import get_bot_manager, escape
+from handlers.master._utils import get_bot_manager, escape, build_free_block_reply, build_basic_expired_reply
 
 logger = logging.getLogger(__name__)
 
@@ -42,14 +42,16 @@ async def new_bot_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     # 检查 VIP 0 用户数量限制
     if not await check_vip0_capacity(user_id):
-        await _retry_send(update.message.reply_text,
-            "⚠️ 系统资源紧张，当前暂不接受新用户创建 Bot。\n\n"
-            "💡 请升级 VIP 即可继续使用：/vip"
-        )
+        text, markup = await build_free_block_reply()
+        await _retry_send(update.message.reply_text, text, parse_mode="HTML", reply_markup=markup)
         return ConversationHandler.END
 
     max_bots = await get_max_bots_for_user(user_id)
     user_bots = await get_user_bots_by_owner(user_id)
+    if max_bots == 0:
+        text, markup = build_basic_expired_reply()
+        await _retry_send(update.message.reply_text, text, parse_mode="HTML", reply_markup=markup)
+        return ConversationHandler.END
     if len(user_bots) >= max_bots:
         await _retry_send(update.message.reply_text, 
             f"⚠️ 你已达到 Bot 数量上限（{max_bots} 个）。\n\n"
@@ -191,16 +193,20 @@ async def new_bot_input_token(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 检查 VIP 0 用户数量限制
     if not await check_vip0_capacity(user_id):
-        await status_msg.edit_text(
-            "⚠️ 系统资源紧张，当前暂不接受新用户创建 Bot。\n\n"
-            "💡 请升级 VIP 即可继续使用：/vip"
-        )
+        text, markup = await build_free_block_reply()
+        await status_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
         context.user_data.pop('new_bot_username', None)
         context.user_data.pop('new_bot_name', None)
         return ConversationHandler.END
 
     max_bots = await get_max_bots_for_user(user_id)
     user_bots = await get_user_bots_by_owner(user_id)
+    if max_bots == 0:
+        text, markup = build_basic_expired_reply()
+        await status_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        context.user_data.pop('new_bot_username', None)
+        context.user_data.pop('new_bot_name', None)
+        return ConversationHandler.END
     if len(user_bots) >= max_bots:
         await status_msg.edit_text(
             f"⚠️ 你已达到 Bot 数量上限（{max_bots} 个）。\n\n"
@@ -264,15 +270,17 @@ async def add_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # 检查 VIP 0 用户数量限制
     if not await check_vip0_capacity(user_id):
-        await _retry_send(update.message.reply_text,
-            "⚠️ 系统资源紧张，当前暂不接受新用户创建 Bot。\n\n"
-            "💡 请升级 VIP 即可继续使用：/vip"
-        )
+        text, markup = await build_free_block_reply()
+        await _retry_send(update.message.reply_text, text, parse_mode="HTML", reply_markup=markup)
         return
 
     # 检查已有 Bot 数量
     max_bots = await get_max_bots_for_user(user_id)
     user_bots = await get_user_bots_by_owner(user_id)
+    if max_bots == 0:
+        text, markup = build_basic_expired_reply()
+        await _retry_send(update.message.reply_text, text, parse_mode="HTML", reply_markup=markup)
+        return
     if len(user_bots) >= max_bots:
         await _retry_send(update.message.reply_text, 
             f"⚠️ 你已达到 Bot 数量上限（{max_bots} 个）。\n\n"
@@ -342,14 +350,16 @@ async def add_bot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # 检查 VIP 0 用户数量限制
     if not await check_vip0_capacity(user_id):
-        await status_msg.edit_text(
-            "⚠️ 系统资源紧张，当前暂不接受新用户创建 Bot。\n\n"
-            "💡 请升级 VIP 即可继续使用：/vip"
-        )
+        text, markup = await build_free_block_reply()
+        await status_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
         return
 
     max_bots = await get_max_bots_for_user(user_id)
     user_bots = await get_user_bots_by_owner(user_id)
+    if max_bots == 0:
+        text, markup = build_basic_expired_reply()
+        await status_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        return
     if len(user_bots) >= max_bots:
         await status_msg.edit_text(
             f"⚠️ 你已达到 Bot 数量上限（{max_bots} 个）。\n\n"

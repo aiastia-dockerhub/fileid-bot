@@ -7,12 +7,14 @@ from senders import _retry_send
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import ContextTypes
 
-from config import VIP_PLANS, VIP_FEATURES, VIP_EXPIRE_NOTICE_DAYS, PREMIUM_GIFT_PRICES, PREMIUM_USER_MARKUP
+from config import (VIP_PLANS, VIP_FEATURES, VIP_EXPIRE_NOTICE_DAYS,
+                    PREMIUM_GIFT_PRICES, PREMIUM_USER_MARKUP, BASIC_LEVEL)
 from db.vip import (
     get_user_vip_info, get_user_vip_level, get_max_bots_for_user,
     update_user_vip, record_star_payment, get_payment_history,
     get_active_bots_by_owner, get_active_bots_count_by_owner,
     pause_user_bot, resume_user_bot, get_paused_bots_by_owner,
+    is_free_registration_closed,
 )
 from handlers.master._utils import get_bot_manager, escape
 
@@ -25,10 +27,11 @@ async def vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """/vip 查看 VIP 状态和购买选项"""
     user_id = update.effective_user.id
     vip_info = await get_user_vip_info(user_id)
+    free_closed = await is_free_registration_closed()
 
     # 构建状态显示
     if vip_info['vip_level'] == 0:
-        status_text = "🎫 <b>当前状态：</b>免费用户"
+        status_text = "🎫 <b>当前状态：</b>免费用户" + ("（老用户保留）" if free_closed else "")
         expire_text = ""
     else:
         if vip_info['is_active']:
@@ -50,8 +53,13 @@ async def vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"📋 <b>VIP 等级对比</b>\n\n"
     )
 
-    # 显示各等级对比
-    for level in sorted(VIP_PLANS.keys()):
+    if free_closed:
+        text += "ℹ️ 免费注册已停止，新用户可购买基础版使用。\n\n"
+
+    # 显示各等级对比：免费关闭时用「基础版」替代「免费」入口
+    display_levels = [0, BASIC_LEVEL, 1, 2, 3] if free_closed else [0, 1, 2, 3]
+
+    for level in display_levels:
         plan = VIP_PLANS[level]
         # 拼接该等级的特权标注（目前只有转发保护）
         features = VIP_FEATURES.get(level, {})
@@ -60,13 +68,16 @@ async def vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             feature_tags.append("🔒 含转发保护")
         feature_text = f"  {'  '.join(feature_tags)}" if feature_tags else ""
 
+        current = "  ✅ 当前" if level == vip_info['vip_level'] and vip_info['is_active'] else ""
+
         if level == 0:
             text += f"  {plan['name']} — {plan['max_bots']} 个 Bot — 免费{feature_text}\n"
+        elif level == BASIC_LEVEL:
+            text += f"  💎 {plan['name']} — {plan['max_bots']} 个 Bot — 月付 {plan['monthly_price']}⭐ / 年付 {plan['yearly_price']}⭐{current}{feature_text}\n"
         else:
             stars = "⭐" * level
             monthly = plan['monthly_price']
             yearly = plan['yearly_price']
-            current = "  ✅ 当前" if level == vip_info['vip_level'] and vip_info['is_active'] else ""
             text += f"  {stars} {plan['name']} — {plan['max_bots']} 个 Bot — 月付 {monthly}⭐ / 年付 {yearly}⭐{current}{feature_text}\n"
 
     text += (
@@ -91,18 +102,19 @@ async def vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"（Bot 主人选了「允许/禁止」时，/settings 只显示规则，无切换按钮）"
     )
 
-    # 构建购买按钮
+    # 构建购买按钮（免费关闭时增加基础版入口）
+    buy_levels = [BASIC_LEVEL, 1, 2, 3] if free_closed else [1, 2, 3]
     keyboard = []
 
-    for level in [1, 2, 3]:
+    for level in buy_levels:
         plan = VIP_PLANS[level]
-        stars = "⭐" * level
+        icon = "💎" if level == BASIC_LEVEL else "⭐" * level
         row_monthly = InlineKeyboardButton(
-            f"{stars} {plan['name']} 月付 {plan['monthly_price']}⭐",
+            f"{icon} {plan['name']} 月付 {plan['monthly_price']}⭐",
             callback_data=f"buy_vip|{level}|1"
         )
         row_yearly = InlineKeyboardButton(
-            f"{stars} {plan['name']} 年付 {plan['yearly_price']}⭐",
+            f"{icon} {plan['name']} 年付 {plan['yearly_price']}⭐",
             callback_data=f"buy_vip|{level}|12"
         )
         keyboard.append([row_monthly, row_yearly])
@@ -251,6 +263,11 @@ async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         plan = VIP_PLANS.get(level)
         if not plan:
             await query.answer(ok=False, error_message="无效的VIP等级")
+            return
+
+        # 基础版仅在免费注册关闭时出售（防止免费开放期的过期按钮）
+        if level == BASIC_LEVEL and not await is_free_registration_closed():
+            await query.answer(ok=False, error_message="基础版暂未开放购买")
             return
 
         # 验证价格
@@ -437,31 +454,40 @@ async def handle_expired_vips() -> None:
         user_id = user_info['user_id']
         old_level = user_info['vip_level']
 
-        # 降回 VIP 0
-        from db.vip import _downgrade_expired_user
-        await _downgrade_expired_user(user_id)
-
-        # 暂停多余的 Bot
-        paused_names = await _pause_excess_bots(user_id)
+        if old_level == BASIC_LEVEL:
+            # 基础版过期：保持 level 4（与存量免费用户区分），暂停全部 Bot
+            paused_names = await _pause_excess_bots(user_id, keep=0)
+            notice_header = (
+                f"⚠️ <b>基础版已过期</b>\n\n"
+                f"你的 基础版 已到期。\n"
+            )
+            notice_footer = "\n\n💡 续费基础版或升级 VIP 后，Bot 将自动恢复运行。\n使用 /vip 查看续费选项"
+        else:
+            # VIP 过期：降回 VIP 0，保留免费额度的 Bot
+            from db.vip import _downgrade_expired_user
+            await _downgrade_expired_user(user_id)
+            paused_names = await _pause_excess_bots(user_id)
+            notice_header = (
+                f"⚠️ <b>VIP 已过期</b>\n\n"
+                f"你的 {VIP_PLANS.get(old_level, {}).get('name', 'VIP')} 已到期。\n"
+                f"已恢复为免费用户（最多 1 个 Bot）。\n"
+            )
+            notice_footer = "\n\n使用 /vip 查看续费选项"
 
         # 通知用户
         try:
             import __main__
             master_app = getattr(__main__, 'master_app', None)
             if master_app:
-                text = (
-                    f"⚠️ <b>VIP 已过期</b>\n\n"
-                    f"你的 {VIP_PLANS.get(old_level, {}).get('name', 'VIP')} 已到期。\n"
-                    f"已恢复为免费用户（最多 1 个 Bot）。\n"
-                )
+                text = notice_header
                 if paused_names:
                     text += f"\n以下 Bot 已暂停：\n"
                     for name in paused_names:
                         text += f"  🤖 @{escape(name)}\n"
-                    text += f"\n💡 续费 VIP 后 Bot 将自动恢复运行。"
+                    text += f"\n💡 续费后 Bot 将自动恢复运行。"
 
-                text += "\n\n使用 /vip 查看续费选项"
-                await _retry_send(master_app.bot.send_message, 
+                text += notice_footer
+                await _retry_send(master_app.bot.send_message,
                     chat_id=user_id,
                     text=text,
                     parse_mode="HTML",
@@ -490,12 +516,16 @@ async def send_expire_reminders() -> None:
             import __main__
             master_app = getattr(__main__, 'master_app', None)
             if master_app:
-                await _retry_send(master_app.bot.send_message, 
+                if level == BASIC_LEVEL:
+                    consequence = "到期后你的 Bot 将被暂停。"
+                else:
+                    consequence = f"到期后 Bot 数量限制将恢复为 {VIP_PLANS[0]['max_bots']} 个。"
+                await _retry_send(master_app.bot.send_message,
                     chat_id=user_id,
                     text=(
                         f"⏰ <b>VIP 即将到期</b>\n\n"
                         f"你的 {plan.get('name', 'VIP')} 将在 {expire_at} 到期。\n"
-                        f"到期后 Bot 数量限制将恢复为 {VIP_PLANS[0]['max_bots']} 个。\n\n"
+                        f"{consequence}\n\n"
                         f"💡 使用 /vip 续费，时间会自动叠加哦！"
                     ),
                     parse_mode="HTML",
@@ -506,16 +536,19 @@ async def send_expire_reminders() -> None:
 
 # ==================== 内部辅助函数 ====================
 
-async def _pause_excess_bots(user_id: int) -> list:
-    """暂停超出限制的Bot，返回被暂停的Bot用户名列表"""
-    max_bots = VIP_PLANS[0]['max_bots']  # 过期后用免费用户的限制
+async def _pause_excess_bots(user_id: int, keep: int = None) -> list:
+    """暂停超出限制的Bot，返回被暂停的Bot用户名列表
+    keep 默认为免费用户上限；基础版过期时传 keep=0 暂停全部
+    """
+    if keep is None:
+        keep = VIP_PLANS[0]['max_bots']  # 过期后用免费用户的限制
     bots = await get_active_bots_by_owner(user_id)
 
-    if len(bots) <= max_bots:
+    if len(bots) <= keep:
         return []
 
-    # 按创建时间排序，保留最早的 max_bots 个
-    to_pause = bots[max_bots:]
+    # 按创建时间排序，保留最早的 keep 个
+    to_pause = bots[keep:]
     paused_names = []
 
     mgr = get_bot_manager()
