@@ -408,14 +408,18 @@ async def resume_user_bot(bot_db_id: int) -> bool:
 
 
 async def get_vip0_user_count() -> int:
-    """获取当前免费（VIP 0）用户数量（有 Bot 的才算占用名额，VIP/基础版用户不占）"""
+    """获取当前免费（VIP 0）用户数量，口径：
+    - 按用户去重（不是按 Bot 数量）
+    - 只统计名下有运行中（active）Bot 的用户——暂停/管理员停止/封禁/删除的 Bot 不占名额
+    - VIP / 基础版用户的 Bot 不占免费名额
+    """
     async with get_session() as session:
         result = await session.execute(
             select(func.count(func.distinct(UserBot.owner_id)))
             .select_from(UserBot)
             .outerjoin(User, UserBot.owner_id == User.user_id)
             .where(
-                UserBot.status != 'deleted',
+                UserBot.status == 'active',
                 func.coalesce(User.vip_level, 0) == 0,
             )
         )

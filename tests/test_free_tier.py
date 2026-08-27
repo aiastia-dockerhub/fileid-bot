@@ -258,6 +258,23 @@ class TestCapacityGate(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await get_vip0_user_count(), 1)  # 只有 free_u
 
+    async def test_vip0_count_only_running_bots(self):
+        """免费名额口径：只有运行中（active）的 Bot 才占名额，暂停/管理员停止的不占"""
+        running_u, paused_u, stopped_u = 2060, 2061, 2062
+        await _add_bot(running_u, 1, status='active')
+        await _add_bot(paused_u, 1, status='paused')
+        await _add_bot(stopped_u, 1, status='admin_stopped')
+
+        self.assertEqual(await get_vip0_user_count(), 1)  # 只有 running_u 占名额
+
+        # 暂停的 Bot 恢复运行后开始占名额
+        async with get_session() as session:
+            from sqlalchemy import update as sa_update
+            await session.execute(
+                sa_update(UserBot).where(UserBot.owner_id == paused_u).values(status='active'))
+            await session.commit()
+        self.assertEqual(await get_vip0_user_count(), 2)
+
     async def test_settings_cache_invalidated(self):
         """修改设置后缓存立即失效，开关即时生效"""
         await set_platform_setting('free_registration', 'closed')

@@ -1119,7 +1119,7 @@ async def set_free_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"📌 免费注册：{'🚫 已关闭（新用户需购买基础版）' if closed else '✅ 开放中'}\n"
             f"💎 基础版价格：月付 {basic['monthly_price']}⭐ / 年付 {basic['yearly_price']}⭐（{basic['max_bots']} 个 Bot）\n"
             f"📊 免费用户上限：{limit_text}\n"
-            f"👥 当前免费占用名额：{count}\n"
+            f"👥 当前免费占用名额：{count}（按用户去重，仅统计有运行中 Bot 的免费用户）\n"
             f"📁 Bot 文件上限（按 Bot 计）：免费 {free_files_text} / 基础版 {basic_files_text} / VIP 不限\n\n"
             f"<b>用法：</b>\n"
             f"• <code>/setfree close</code> — 关闭免费注册\n"
