@@ -13,6 +13,46 @@ from db.models import FileMapping, Collection
 logger = logging.getLogger(__name__)
 
 
+# ==================== Bot 文件数量额度 ====================
+
+async def get_bot_file_count(bot_db_id: int) -> int:
+    """获取 Bot 已保存的文件总数（全部行，含失效行——文件只增不减）"""
+    if not bot_db_id:
+        return 0
+    async with get_session() as session:
+        result = await session.execute(
+            select(func.count()).select_from(FileMapping)
+            .where(FileMapping.bot_db_id == bot_db_id)
+        )
+        return result.scalar() or 0
+
+
+async def get_owner_file_limit(owner_id: int) -> int:
+    """按 Bot 主人 VIP 等级返回单个 Bot 的文件数上限（0 = 不限制）
+    VIP 1-3 不限制；基础版 / 免费为运行时可调上限（/setfree basicfiles|files）
+    """
+    from db.vip import get_user_vip_level, get_free_bot_files_limit, get_basic_bot_files_limit
+    from config import BASIC_LEVEL
+    level = await get_user_vip_level(owner_id)
+    if level in (1, 2, 3):
+        return 0
+    if level == BASIC_LEVEL:
+        return await get_basic_bot_files_limit()
+    return await get_free_bot_files_limit()
+
+
+async def is_bot_over_file_quota(bot_db_id: int, owner_id: int) -> bool:
+    """判断该 Bot 保存此文件后是否已超出主人的文件额度
+    口径：count > limit 才算超（上限内最后一个文件仍正常返回代码）
+    VIP 主人直接 False（不查计数）
+    """
+    limit = await get_owner_file_limit(owner_id)
+    if limit <= 0:
+        return False
+    count = await get_bot_file_count(bot_db_id)
+    return count > limit
+
+
 async def get_active_bot_files(since_date: str = None) -> List[Dict]:
     """获取活跃Bot的文件列表，按bot_username+created_at排序，支持日期过滤"""
     async with get_session() as session:

@@ -102,6 +102,11 @@ FORWARD_MODE_USER_CHOICE = 1 # 用户自定义
 # VIP 0（免费）用户最大数量限制，超过后提示升级 VIP
 MAX_VIP0_USERS = int(os.environ.get('MAX_VIP0_USERS', '0'))  # 0 = 不限制
 
+# ===== Bot 文件数量上限（按 Bot 计，超限后文件仍入库但不返回代码） =====
+# 免费 / 基础版可运行时调整（/setfree files N、/setfree basicfiles N），VIP 1-3 不限制
+FREE_BOT_FILES_LIMIT = int(os.environ.get('FREE_BOT_FILES_LIMIT', '20000'))
+BASIC_BOT_FILES_LIMIT = int(os.environ.get('BASIC_BOT_FILES_LIMIT', '50000'))
+
 # VIP 到期提醒提前天数
 VIP_EXPIRE_NOTICE_DAYS = 3
 

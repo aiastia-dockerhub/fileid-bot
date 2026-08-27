@@ -166,6 +166,12 @@ async def init_db():
             if 'bot_db_id' not in columns:
                 await conn.execute(text("ALTER TABLE collections ADD COLUMN bot_db_id INTEGER"))
 
+            # 检查 users.vip_migrated 列（会员迁移一次性标记）
+            result = await conn.execute(text("PRAGMA table_info(users)"))
+            columns = {row[1] for row in result}
+            if 'vip_migrated' not in columns:
+                await conn.execute(text("ALTER TABLE users ADD COLUMN vip_migrated INTEGER DEFAULT 0"))
+
             # 创建 users 表索引
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_sp_user ON star_payments(user_id)"))
@@ -206,11 +212,13 @@ async def init_db():
             for ddl in (
                 "CREATE INDEX idx_file_fuid_bot ON file_mappings(bot_db_id, file_unique_id)",
                 "CREATE INDEX idx_file_created_bot ON file_mappings(bot_db_id, created_at)",
+                # users.vip_migrated 迁移列（MySQL 无 PRAGMA，靠 try/except 吞已存在异常）
+                "ALTER TABLE users ADD COLUMN vip_migrated INTEGER DEFAULT 0",
             ):
                 try:
                     await conn.execute(text(ddl))
                 except Exception:
-                    pass  # 索引已存在
+                    pass  # 索引/列已存在
 
     logger.info("数据库初始化完成 (type=%s)", DB_TYPE)
 

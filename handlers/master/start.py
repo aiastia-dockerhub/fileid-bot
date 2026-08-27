@@ -20,12 +20,16 @@ logger = logging.getLogger(__name__)
 
 async def master_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """主Bot /start 命令"""
-    # Deep-link 处理：/start claim_xxx → 礼物领取
+    # Deep-link 处理：/start claim_xxx → 礼物领取；/start mig_xxx → 会员迁移领取
     if context.args:
         arg = context.args[0].strip()
         if arg.startswith("claim_"):
             from handlers.master.gifts import handle_gift_claim
             await handle_gift_claim(update, context, arg)
+            return
+        if arg.startswith("mig_"):
+            from handlers.master.stars import handle_vip_migration_claim
+            await handle_vip_migration_claim(update, context, arg)
             return
 
     text = (

@@ -29,6 +29,32 @@ from handlers.master._utils import get_bot_manager, escape
 
 logger = logging.getLogger(__name__)
 
+# VIP 用户 Telegram 显示名缓存（/setvip list 用，避免每次命令逐个 get_chat）
+_vip_name_cache: dict = {}  # user_id -> (name, ts)
+_VIP_NAME_TTL = 3600
+
+
+async def _get_user_display_name(bot, user_id: int) -> str:
+    """尽力获取用户 Telegram 显示名（1 小时缓存），失败回退 用户{ID}"""
+    import time as _time
+    now = _time.time()
+    cached = _vip_name_cache.get(user_id)
+    if cached and now - cached[1] < _VIP_NAME_TTL:
+        return cached[0]
+    name = None
+    try:
+        chat = await bot.get_chat(user_id)
+        if chat:
+            name = chat.first_name or chat.username or None
+    except Exception:
+        name = None
+    display = name if name else f"用户{user_id}"
+    _vip_name_cache[user_id] = (display, now)
+    if len(_vip_name_cache) > 5000:
+        for k in sorted(_vip_name_cache, key=lambda k: _vip_name_cache[k][1])[:2500]:
+            del _vip_name_cache[k]
+    return display
+
 
 async def platform_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/platform 管理员查看平台统计和 Bot 详情"""
@@ -816,6 +842,7 @@ async def set_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "👑 <b>VIP 管理命令</b>\n\n"
             "用法：\n"
             "• <code>/setvip info USER_ID</code> — 查看用户VIP信息\n"
+            "• <code>/setvip list</code> — 查看所有付费会员列表\n"
             "• <code>/setvip USER_ID LEVEL [MONTHS]</code> — 设置VIP等级\n"
             "• <code>/setvip USER_ID 0</code> — 取消VIP\n\n"
             "VIP 等级：\n"
@@ -854,6 +881,81 @@ async def set_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"⏳ 剩余天数: {info['remaining_days']}",
             parse_mode="HTML"
         )
+        return
+
+    # /setvip list — 列出所有付费会员
+    if args[0].lower() == 'list':
+        from config import VIP_PLANS
+        from db.vip import get_all_vip_users, get_active_bots_by_owner
+
+        users = await get_all_vip_users()
+        if not users:
+            await _retry_send(update.message.reply_text, "📭 暂无付费会员用户。")
+            return
+
+        mgr = get_bot_manager()
+        active_count = 0
+        body = ""
+        for u in users:
+            level = u['vip_level']
+            plan = VIP_PLANS.get(level, {})
+            expire_at = u.get('vip_expire_at')
+            is_active = True
+            if expire_at:
+                try:
+                    is_active = datetime.now() <= datetime.strptime(expire_at, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    is_active = False
+            if is_active:
+                active_count += 1
+
+            name = await _get_user_display_name(context.bot, u['user_id'])
+            expire_text = (expire_at or '永久') + ("" if is_active else "（已过期）")
+            migrated_tag = " 🔄" if u.get('vip_migrated') else ""
+            body += (
+                f"{'✅' if is_active else '❌'} <b>{escape(name)}</b>{migrated_tag}\n"
+                f"   🆔 <a href=\"tg://user?id={u['user_id']}\">{u['user_id']}</a>"
+                f" | {plan.get('name', f'Level {level}')} | 📅 {escape(str(expire_text))}\n"
+            )
+
+            bots = await get_active_bots_by_owner(u['user_id'])
+            if bots:
+                bot_parts = []
+                for b in bots:
+                    running = mgr and b['id'] in mgr.get_all_apps()
+                    st = "🟢" if running else ("⏸️" if b['status'] == 'paused' else "🔴")
+                    bot_parts.append(f"{st} @{escape(b.get('bot_username') or str(b['id']))}")
+                body += "   🤖 " + " | ".join(bot_parts) + "\n"
+            else:
+                body += "   🤖 无 Bot\n"
+
+        text = (
+            f"👑 <b>付费会员列表</b>（共 {len(users)} 人，有效 {active_count}）\n"
+            f"（🔄 = 通过迁移获得的会员）\n\n"
+            f"{body}"
+        )
+
+        # Telegram 消息长度限制，分段发送
+        if len(text) > 4000:
+            parts = []
+            current = ""
+            for line in text.split('\n'):
+                if len(current) + len(line) + 1 > 3900:
+                    parts.append(current)
+                    current = line + '\n'
+                else:
+                    current += line + '\n'
+            if current:
+                parts.append(current)
+            for i, part in enumerate(parts):
+                if i == 0:
+                    await _retry_send(update.message.reply_text, part, parse_mode="HTML")
+                else:
+                    await _retry_send(context.bot.send_message,
+                        chat_id=update.message.chat_id,
+                        text=part, parse_mode="HTML")
+        else:
+            await _retry_send(update.message.reply_text, text, parse_mode="HTML")
         return
 
     # /setvip <user_id> <level> [months]
@@ -945,16 +1047,25 @@ async def set_free_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         count = await get_vip0_user_count()
         limit_text = "不限制" if limit <= 0 else str(limit)
 
+        from db.vip import get_free_bot_files_limit, get_basic_bot_files_limit
+        free_files = await get_free_bot_files_limit()
+        basic_files = await get_basic_bot_files_limit()
+        free_files_text = "不限" if free_files <= 0 else f"{free_files:,}"
+        basic_files_text = "不限" if basic_files <= 0 else f"{basic_files:,}"
+
         text = (
             f"🆓 <b>免费注册管理</b>\n\n"
             f"📌 免费注册：{'🚫 已关闭（新用户需购买基础版）' if closed else '✅ 开放中'}\n"
             f"💎 基础版价格：月付 {basic['monthly_price']}⭐ / 年付 {basic['yearly_price']}⭐（{basic['max_bots']} 个 Bot）\n"
             f"📊 免费用户上限：{limit_text}\n"
-            f"👥 当前免费占用名额：{count}\n\n"
+            f"👥 当前免费占用名额：{count}\n"
+            f"📁 Bot 文件上限（按 Bot 计）：免费 {free_files_text} / 基础版 {basic_files_text} / VIP 不限\n\n"
             f"<b>用法：</b>\n"
             f"• <code>/setfree close</code> — 关闭免费注册\n"
             f"• <code>/setfree open</code> — 恢复免费注册\n"
-            f"• <code>/setfree limit N</code> — 设置上限（0=不限制）\n\n"
+            f"• <code>/setfree limit N</code> — 设置免费用户上限（0=不限制）\n"
+            f"• <code>/setfree files N</code> — 免费用户 Bot 文件上限（0=不限）\n"
+            f"• <code>/setfree basicfiles N</code> — 基础版 Bot 文件上限（0=不限）\n\n"
             f"💡 关闭免费注册后，存量免费用户不受影响；免费开放期间不出售基础版。"
         )
         await _retry_send(update.message.reply_text, text, parse_mode="HTML")
@@ -1008,11 +1119,39 @@ async def set_free_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         logger.info("管理员 %s 设置免费用户上限为 %d", user_id, n)
 
+    elif action in ('files', 'basicfiles'):
+        if len(args) < 2:
+            await _retry_send(update.message.reply_text,
+                "❌ 请指定数量。\n用法：<code>/setfree files N</code>（0=不限）",
+                parse_mode="HTML"
+            )
+            return
+        try:
+            n = int(args[1])
+        except ValueError:
+            await _retry_send(update.message.reply_text, "❌ 数量必须是数字。")
+            return
+        if n < 0:
+            await _retry_send(update.message.reply_text, "❌ 数量不能为负数。")
+            return
+
+        setting_key = 'free_bot_files' if action == 'files' else 'basic_bot_files'
+        tier_name = "免费用户" if action == 'files' else "基础版"
+        await set_platform_setting(setting_key, str(n))
+        await invalidate_free_settings_cache()
+        limit_text = "不限制" if n == 0 else f"{n:,} 个"
+        await _retry_send(update.message.reply_text,
+            f"✅ {tier_name} Bot 文件上限已设置为 {limit_text}（按 Bot 计）。"
+        )
+        logger.info("管理员 %s 设置 %s Bot 文件上限为 %d", user_id, tier_name, n)
+
     else:
         await _retry_send(update.message.reply_text,
             "❓ 未知操作。\n\n"
             "• <code>/setfree close</code> — 关闭免费注册\n"
             "• <code>/setfree open</code> — 恢复免费注册\n"
-            "• <code>/setfree limit N</code> — 设置免费用户上限",
+            "• <code>/setfree limit N</code> — 设置免费用户上限\n"
+            "• <code>/setfree files N</code> — 免费用户 Bot 文件上限\n"
+            "• <code>/setfree basicfiles N</code> — 基础版 Bot 文件上限",
             parse_mode="HTML"
         )

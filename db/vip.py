@@ -9,7 +9,8 @@ from sqlalchemy import select, update, func, text
 from db.core import get_session, _model_to_dict
 from db.models import User, StarPayment, UserBot, UserBotPref
 from db.bots import get_platform_setting
-from config import VIP_PLANS, VIP_FEATURES, MAX_VIP0_USERS, BASIC_LEVEL
+from config import (VIP_PLANS, VIP_FEATURES, MAX_VIP0_USERS, BASIC_LEVEL,
+                    FREE_BOT_FILES_LIMIT, BASIC_BOT_FILES_LIMIT)
 
 logger = logging.getLogger(__name__)
 
@@ -59,11 +60,42 @@ async def get_max_vip0_users_limit() -> int:
     return limit
 
 
+async def _get_bot_files_limit(setting_key: str, env_default: int, cache_key: str) -> int:
+    """Bot 文件数上限通用读取：运行时设置 > 环境变量默认值（0 = 不限制）"""
+    r = await _get_redis()
+    cached = await r.cache_get(cache_key)
+    if cached is not None:
+        try:
+            return int(cached)
+        except ValueError:
+            pass
+
+    value = await get_platform_setting(setting_key, "")
+    try:
+        limit = int(value) if value else env_default
+    except ValueError:
+        limit = env_default
+    await r.cache_set(cache_key, str(limit), ttl=_SETTING_CACHE_TTL)
+    return limit
+
+
+async def get_free_bot_files_limit() -> int:
+    """免费用户单个 Bot 的文件数上限（/setfree files N 调整，默认 20000）"""
+    return await _get_bot_files_limit("free_bot_files", FREE_BOT_FILES_LIMIT, "setting:free_bot_files")
+
+
+async def get_basic_bot_files_limit() -> int:
+    """基础版用户单个 Bot 的文件数上限（/setfree basicfiles N 调整，默认 50000）"""
+    return await _get_bot_files_limit("basic_bot_files", BASIC_BOT_FILES_LIMIT, "setting:basic_bot_files")
+
+
 async def invalidate_free_settings_cache() -> None:
-    """清除免费注册设置缓存（/setfree 修改后调用，立即生效）"""
+    """清除免费注册/名额/文件限额设置缓存（/setfree 修改后调用，立即生效）"""
     r = await _get_redis()
     await r.cache_delete("setting:free_registration")
     await r.cache_delete("setting:max_vip0_users")
+    await r.cache_delete("setting:free_bot_files")
+    await r.cache_delete("setting:basic_bot_files")
 
 
 async def get_or_create_user(user_id: int) -> Dict:
@@ -195,6 +227,8 @@ async def update_user_vip(user_id: int, level: int, months: int) -> bool:
             new_expire = base_time + timedelta(days=30 * months)
             user.vip_level = level
             user.vip_expire_at = new_expire.strftime("%Y-%m-%d %H:%M:%S")
+            # 新授予的会员可再迁移（清除「迁移收到」一次性标记）
+            user.vip_migrated = 0
 
             await session.commit()
             logger.info("用户 %s VIP 升级到 %d（%d个月），过期时间: %s",
@@ -298,6 +332,17 @@ async def get_expired_users() -> List[Dict]:
                 User.vip_expire_at != None,  # noqa: E711
                 User.vip_expire_at <= now_str,
             )
+        )
+        users = result.scalars().all()
+        return [_model_to_dict(u) for u in users]
+
+
+async def get_all_vip_users() -> List[Dict]:
+    """获取所有付费会员用户（vip_level>0，含基础版与已过期），按等级降序"""
+    async with get_session() as session:
+        result = await session.execute(
+            select(User).where(User.vip_level > 0)
+            .order_by(User.vip_level.desc(), User.created_at)
         )
         users = result.scalars().all()
         return [_model_to_dict(u) for u in users]

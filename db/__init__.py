@@ -41,6 +41,7 @@ from db.vip import (  # noqa: F401
     get_payment_history, get_active_bots_count_by_owner,
     get_active_bots_by_owner, pause_user_bot, resume_user_bot,
     get_paused_bots_by_owner, get_expiring_users, get_expired_users,
+    get_all_vip_users,
     get_bot_forward_mode, set_bot_forward_mode,
     set_bot_auto_delete,
     get_user_forward_protect, set_user_forward_protect,
@@ -48,4 +49,7 @@ from db.vip import (  # noqa: F401
 )
 from db.gifts import (  # noqa: F401
     create_claim, get_claim, try_claim, list_claims, get_pending_claims_count,
+)
+from db.migrations import (  # noqa: F401
+    create_migration, get_migration, claim_migration,
 )

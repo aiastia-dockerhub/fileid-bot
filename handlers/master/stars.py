@@ -2,6 +2,7 @@
 import json
 import logging
 import time
+from datetime import datetime
 from senders import _retry_send
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
@@ -10,12 +11,13 @@ from telegram.ext import ContextTypes
 from config import (VIP_PLANS, VIP_FEATURES, VIP_EXPIRE_NOTICE_DAYS,
                     PREMIUM_GIFT_PRICES, PREMIUM_USER_MARKUP, BASIC_LEVEL)
 from db.vip import (
-    get_user_vip_info, get_user_vip_level, get_max_bots_for_user,
+    get_or_create_user, get_user_vip_info, get_user_vip_level, get_max_bots_for_user,
     update_user_vip, record_star_payment, get_payment_history,
     get_active_bots_by_owner, get_active_bots_count_by_owner,
     pause_user_bot, resume_user_bot, get_paused_bots_by_owner,
     is_free_registration_closed,
 )
+from db.migrations import create_migration, claim_migration
 from handlers.master._utils import get_bot_manager, escape
 
 logger = logging.getLogger(__name__)
@@ -123,6 +125,7 @@ async def vip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     bottom_row = []
     if vip_info['vip_level'] > 0 and vip_info['is_active']:
         bottom_row.append(InlineKeyboardButton("📜 支付记录", callback_data="vip_history"))
+        bottom_row.append(InlineKeyboardButton("🔄 迁移会员", callback_data="vip_migrate"))
     keyboard.append(bottom_row)
 
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -623,6 +626,109 @@ async def _try_resume_paused_bots(user_id: int, new_level: int) -> None:
             pass
 
 
+# ==================== 会员迁移 ====================
+
+async def vip_migrate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """处理「🔄 迁移会员」按钮：生成一次性迁移码"""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    user = await get_or_create_user(user_id)
+
+    if not user or (user.get('vip_level') or 0) <= 0:
+        await query.answer("当前没有可迁移的会员", show_alert=True)
+        return
+
+    expire_at = user.get('vip_expire_at')
+    if expire_at:
+        try:
+            if datetime.now() > datetime.strptime(expire_at, "%Y-%m-%d %H:%M:%S"):
+                await query.answer("会员已过期，无法迁移", show_alert=True)
+                return
+        except ValueError:
+            pass
+
+    if user.get('vip_migrated'):
+        await query.answer("该会员是通过迁移获得的，不能再迁移", show_alert=True)
+        return
+
+    mig = await create_migration(user_id, user['vip_level'], expire_at)
+    if not mig:
+        await _retry_send(query.message.reply_text, "❌ 生成迁移码失败，请稍后重试。")
+        return
+
+    plan = VIP_PLANS.get(user['vip_level'], {})
+    link = f"https://t.me/{context.bot.username}?start={mig['code']}"
+    text = (
+        f"🔄 <b>会员迁移码已生成</b>\n\n"
+        f"👑 当前会员：{plan.get('name', 'VIP')}\n"
+        f"📅 到期时间：{expire_at or '永久'}\n\n"
+        f"🔑 <b>迁移码：</b><code>{escape(mig['code'])}</code>\n\n"
+        f"<b>使用方法</b>：\n"
+        f"1️⃣ 切换到要接收会员的新账号\n"
+        f"2️⃣ 点击链接直接领取：\n{link}\n"
+        f"（或让新账号向本 Bot 发送 <code>/start {escape(mig['code'])}</code>）\n\n"
+        f"⚠️ <b>注意</b>：\n"
+        f"• 迁移码有效期与会员有效期一致，过期失效\n"
+        f"• 只能迁移一次，领取后新账号不能再继续迁移\n"
+        f"• 迁移后当前账号会员清零，超出免费额度的 Bot 会被暂停\n"
+        f"• 重新生成迁移码会使旧码作废"
+    )
+    await _retry_send(query.message.reply_text, text, parse_mode="HTML",
+                      disable_web_page_preview=True)
+
+
+async def handle_vip_migration_claim(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                     code: str) -> None:
+    """处理 /start mig_xxx：领取会员迁移码"""
+    user_id = update.effective_user.id
+    status, info = await claim_migration(code, user_id)
+
+    if status == 'ok':
+        plan = VIP_PLANS.get(info['vip_level'], {})
+        await _retry_send(update.message.reply_text,
+            f"🎉 <b>会员迁移成功！</b>\n\n"
+            f"👑 会员等级：{plan.get('name', 'VIP')}\n"
+            f"📅 到期时间：{info['vip_expire_at'] or '永久'}\n"
+            f"🤖 可创建 Bot 数：{plan.get('max_bots', VIP_PLANS[0]['max_bots'])} 个\n\n"
+            f"⚠️ 该会员仅可迁移一次（当前账号已锁定，不可再迁出）。",
+            parse_mode="HTML"
+        )
+        # 新账号：恢复因额度暂停的 Bot
+        await _try_resume_paused_bots(user_id, info['vip_level'])
+        # 旧账号：降为免费后暂停超额 Bot
+        await _pause_excess_bots(info['from_user_id'])
+        # 通知旧账号
+        try:
+            import __main__
+            master_app = getattr(__main__, 'master_app', None)
+            if master_app:
+                await _retry_send(master_app.bot.send_message,
+                    chat_id=info['from_user_id'],
+                    text=(
+                        f"📤 <b>会员已迁移</b>\n\n"
+                        f"你的 {plan.get('name', 'VIP')} 已成功迁移到新账号。\n"
+                        f"当前账号已恢复为免费用户。"
+                    ),
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.error("通知迁移源用户 %s 失败: %s", info['from_user_id'], e)
+        return
+
+    error_text = {
+        'invalid': "❌ 迁移码无效或已被使用。",
+        'expired': "❌ 该迁移码对应的会员已过期，迁移码已失效。",
+        'self': "❌ 不能迁移到自己的账号。",
+        'target_has_vip': (
+            "❌ 当前账号已有有效会员，无法接收迁移的会员。\n\n"
+            "💡 请先等待当前会员到期后再领取。"
+        ),
+    }.get(status, "❌ 迁移失败，请稍后重试。")
+    await _retry_send(update.message.reply_text, error_text, parse_mode="HTML")
+
+
 # ==================== 回调路由器 ====================
 
 async def vip_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -634,5 +740,7 @@ async def vip_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE
         await buy_vip_callback(update, context)
     elif data == "vip_history":
         await vip_history_callback(update, context)
+    elif data == "vip_migrate":
+        await vip_migrate_callback(update, context)
     else:
         await query.answer("未知操作", show_alert=True)

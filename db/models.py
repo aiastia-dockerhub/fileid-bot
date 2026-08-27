@@ -97,6 +97,9 @@ class User(Base):
     vip_level: Mapped[int] = mapped_column(Integer, default=0)
     vip_expire_at: Mapped[str] = mapped_column(String, nullable=True)
     created_at: Mapped[str] = mapped_column(String, nullable=True)
+    # 当前会员是否为「迁移收到」的：1=不能再生成迁移码（一次性规则），
+    # 购买/续费/admin 设置新会员时会重置为 0
+    vip_migrated: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class StarPayment(Base):
@@ -140,6 +143,23 @@ class GiftClaim(Base):
     claimant_user_id: Mapped[int] = mapped_column(Integer, nullable=True)  # 领取者 user_id
     created_at: Mapped[str] = mapped_column(String, nullable=True)
     claimed_at: Mapped[str] = mapped_column(String, nullable=True)
+
+
+class VipMigration(Base):
+    """VIP 会员迁移码（一次性，有效期=源会员剩余有效期）"""
+    __tablename__ = 'vip_migrations'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # 迁移码（URL 友好，唯一），如 mig_abc123xyz，用于 /start mig_xxx 深链
+    code: Mapped[str] = mapped_column(String, unique=True, nullable=False, index=True)
+    from_user_id: Mapped[int] = mapped_column(Integer, nullable=False)  # 迁出方 user_id
+    vip_level: Mapped[int] = mapped_column(Integer, default=0)          # 生成时的等级快照（领取时以实际为准）
+    vip_expire_at: Mapped[str] = mapped_column(String, nullable=True)   # 生成时的到期快照
+    # 状态：pending=待领取, used=已使用, cancelled=已作废（生成新码时旧码作废）
+    status: Mapped[str] = mapped_column(String, default='pending')
+    to_user_id: Mapped[int] = mapped_column(Integer, nullable=True)     # 领取方 user_id
+    created_at: Mapped[str] = mapped_column(String, nullable=True)
+    used_at: Mapped[str] = mapped_column(String, nullable=True)
 
 
 class WorkerNode(Base):

@@ -308,12 +308,24 @@ async def get_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if result:
+        # 文件额度检查：超限后文件已入库但不返回代码（VIP 主人不限）
+        from db.files import is_bot_over_file_quota
+        bot_record = context.bot_data.get('bot_record', {})
+        over = await is_bot_over_file_quota(bot_db_id, bot_record.get('owner_id'))
         uid_info = f" file_unique_id: `{file_unique_id}`" if file_unique_id else ""
-        await _retry_send(update.message.reply_text,
-            f"✅ {file_type}ID已保存！{uid_info}\n\n代码: `{result}`\n\n将此代码发送给 `@{bot_username}` 即可获取文件。",
-            parse_mode="Markdown",
-            reply_to_message_id=update.message.reply_to_message.message_id
-        )
+        if over:
+            from handlers.messages import _file_quota_hint_text
+            await _retry_send(update.message.reply_text,
+                f"✅ {file_type}已保存！{uid_info}\n\n" + await _file_quota_hint_text(),
+                parse_mode="Markdown",
+                reply_to_message_id=update.message.reply_to_message.message_id
+            )
+        else:
+            await _retry_send(update.message.reply_text,
+                f"✅ {file_type}ID已保存！{uid_info}\n\n代码: `{result}`\n\n将此代码发送给 `@{bot_username}` 即可获取文件。",
+                parse_mode="Markdown",
+                reply_to_message_id=update.message.reply_to_message.message_id
+            )
     else:
         await _retry_send(update.message.reply_text, "❌ 保存失败，请重试。")
 

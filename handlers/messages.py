@@ -13,9 +13,30 @@ from db import (
     save_file, get_file, get_files_by_codes, get_collection, get_collection_files,
     create_collection, add_file_to_collection, get_user_forward_protect,
 )
+from db.files import is_bot_over_file_quota
 from utils import get_code_prefix, escape_markdown, generate_raw_code, parse_file_code, parse_collection_code
 from senders import send_file_group, _retry_send
 from send_queue import get_queue_from_context, split_files_to_batches
+
+
+async def _is_over_file_quota(context) -> bool:
+    """检查本次保存后 Bot 是否已超出主人的文件额度（VIP 主人不限，直接 False）"""
+    bot_record = context.bot_data.get('bot_record', {})
+    return await is_bot_over_file_quota(bot_record.get('id'), bot_record.get('owner_id'))
+
+
+async def _file_quota_hint_text() -> str:
+    """超出文件额度的升级提示文案（动态读取基础版限额）"""
+    from db.vip import get_basic_bot_files_limit
+    basic_limit = await get_basic_bot_files_limit()
+    basic_line = f"{basic_limit:,} 个文件" if basic_limit > 0 else "不限量"
+    return (
+        "⚠️ 此 Bot 的文件数量已达当前会员的额度上限。\n"
+        "📁 文件仍会保存，但不再返回代码。\n\n"
+        "💡 请 Bot 主人升级会员：\n"
+        f"   💎 基础版 — {basic_line}\n"
+        "   ⭐ VIP — 不限量"
+    )
 
 
 def _ensure_cb_maps(context) -> tuple:
@@ -119,8 +140,16 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         type_name = FILE_TYPE_MAP.get(file_type, file_type)
 
+        # 文件额度检查：超限后文件已入库但不返回代码（VIP 主人不限）
+        over_quota = await _is_over_file_quota(context)
+
         # 如果正在创建集合，追加文件（立即回复，不缓冲）
         if creating_col:
+            if over_quota:
+                await _retry_send(message.reply_text,
+                    text=await _file_quota_hint_text(),
+                    reply_to_message_id=message.message_id)
+                return
             current_count = context.user_data.get('collection_count', 0)
             if current_count >= MAX_COLLECTION_FILES:
                 await _retry_send(message.reply_text, f"⚠️ 集合已满 {MAX_COLLECTION_FILES} 个文件，请发送 `/done` 完成。")
@@ -151,7 +180,7 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             }
 
         buf = context.bot_data['_attachment_reply_buffer'][buffer_key]
-        buf['items'].append((type_name, code, message.message_id))
+        buf['items'].append((type_name, code, message.message_id, over_quota))
 
         # 重置计时器
         if buf['timer']:
@@ -168,20 +197,32 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 items = buf['items']
                 chat_id = buf['chat_id']
 
-                if len(items) == 1:
+                has_over = any(it[3] for it in items)
+                ok_items = [it for it in items if not it[3]]
+
+                if not has_over and len(items) == 1:
                     # 单个附件，直接回复
-                    tn, c, mid = items[0]
+                    tn, c, mid, _ = items[0]
                     await _retry_send(context.bot.send_message,
                         chat_id=chat_id,
                         text=f"✅ {tn}已保存！\n\n代码: `{c}`",
                         parse_mode='Markdown',
                         reply_to_message_id=mid)
                 else:
-                    # 多个附件，合并为一条消息
+                    # 多个附件，合并为一条消息；超额度项不展示代码
                     lines = []
-                    for tn, c, mid in items:
-                        lines.append(f"• {tn}: `{c}`")
-                    reply = f"✅ 已保存 {len(items)} 个文件：\n\n" + "\n".join(lines)
+                    for tn, c, mid, over in items:
+                        if over:
+                            lines.append(f"• {tn}: ⚠️ 已超出文件额度，未返回代码")
+                        else:
+                            lines.append(f"• {tn}: `{c}`")
+                    total = len(items)
+                    ok_count = len(ok_items)
+                    if ok_count == total:
+                        reply = f"✅ 已保存 {total} 个文件：\n\n" + "\n".join(lines)
+                    else:
+                        reply = f"✅ 已保存 {total} 个文件（{ok_count} 个返回代码）：\n\n" + "\n".join(lines)
+                        reply += "\n\n" + await _file_quota_hint_text()
                     # reply_to 第一条消息
                     await _retry_send(context.bot.send_message,
                         chat_id=chat_id,
@@ -474,16 +515,23 @@ async def handle_group_media(update: Update, context: ContextTypes.DEFAULT_TYPE)
             msgs = group_data['messages']
             if not msgs:
                 return
-            codes = await _save_media_messages(msgs, context)
-            if codes:
+            codes, over_count = await _save_media_messages(msgs, context)
+            if codes or over_count:
                 creating_col = context.user_data.get('creating_collection')
-                if creating_col:
+                if creating_col and codes:
                     await _add_to_collection(context, creating_col, codes)
                     count = context.user_data.get('collection_count', 0)
                     reply = f"✅ 媒体组已保存并添加到集合！\n\n共 {len(codes)} 个文件 ({count}/{MAX_COLLECTION_FILES})\n\n"
+                    reply += "\n".join(f"`{c}`" for c in codes)
                 else:
-                    reply = f"✅ 媒体组已保存！共 {len(codes)} 个文件：\n\n"
-                reply += "\n".join(f"`{c}`" for c in codes)
+                    total = len(codes) + over_count
+                    reply = f"✅ 媒体组已保存！共 {total} 个文件"
+                    if over_count:
+                        reply += f"（{len(codes)} 个返回代码）"
+                    reply += "：\n\n"
+                    reply += "\n".join(f"`{c}`" for c in codes) if codes else "（全部超出文件额度）"
+                if over_count:
+                    reply += "\n\n" + await _file_quota_hint_text()
                 await _retry_send(msgs[0].reply_text, reply, parse_mode="Markdown")
         except Exception as e:
             logger.error("process_media_group 失败: %s", e, exc_info=True)
@@ -535,10 +583,17 @@ async def handle_forwarded_media(update: Update, context: ContextTypes.DEFAULT_T
             if not msgs:
                 return
 
-            codes = await _save_media_messages(msgs, context)
+            codes, over_count = await _save_media_messages(msgs, context)
             if not codes:
-                await _retry_send(msgs[0].reply_text, "❌ 转发的媒体组处理失败。")
+                if over_count:
+                    await _retry_send(msgs[0].reply_text, await _file_quota_hint_text())
+                else:
+                    await _retry_send(msgs[0].reply_text, "❌ 转发的媒体组处理失败。")
                 return
+            if over_count:
+                codes_hint = f"\n\n⚠️ 另有 {over_count} 个文件超出额度未保存进集合。"
+            else:
+                codes_hint = ""
 
             # 自动创建集合
             uid = msgs[0].from_user.id
@@ -564,13 +619,17 @@ async def handle_forwarded_media(update: Update, context: ContextTypes.DEFAULT_T
                 logger.error("自动创建转发集合失败: %s", e)
             if not save_ok:
                 reply = f"✅ 转发媒体已保存（共 {len(codes)} 个）：\n\n" + "\n".join(f"`{c}`" for c in codes)
+                if over_count:
+                    reply += codes_hint + "\n\n" + await _file_quota_hint_text()
                 await _retry_send(msgs[0].reply_text, reply, parse_mode="Markdown")
                 return
 
             # 回复
             safe_name = escape_markdown(col_name)
-            reply = f"✅ 转发媒体组已保存并自动创建集合！\n\n📦 集合: *{safe_name}*\n📊 共 {len(codes)} 个文件\n📦 集合代码: `{full_col_code}`\n\n单个文件代码：\n"
+            reply = f"✅ 转发媒体组已保存并自动创建集合！\n\n📦 集合: *{safe_name}*\n📊 共 {len(codes)} 个文件\n📦 集合代码: `{full_col_code}`{codes_hint}\n\n单个文件代码：\n"
             reply += "\n".join(f"`{c}`" for c in codes)
+            if over_count:
+                reply += "\n\n" + await _file_quota_hint_text()
             sk = await _short_key(context, full_col_code)
             keyboard = [[InlineKeyboardButton("📖 分页发送", callback_data=f"s|{sk}"), InlineKeyboardButton("▶️ 自动发送", callback_data=f"a|{sk}")]]
             try:
@@ -604,13 +663,17 @@ def _extract_file_info(message) -> tuple:
     return None, None, 0, ''
 
 
-async def _save_media_messages(messages, context) -> list:
-    """批量保存媒体消息，返回代码列表"""
+async def _save_media_messages(messages, context) -> tuple:
+    """批量保存媒体消息，返回 (代码列表, 超出文件额度未返回代码的数量)
+    超额度的文件已入库但不进代码列表（也不进自动集合，避免绕过额度）"""
     uid = messages[0].from_user.id
     bname = context.bot.username
     code_prefix = get_code_prefix(bname)
-    bot_db_id = context.bot_data.get('bot_record', {}).get('id')
+    bot_record = context.bot_data.get('bot_record', {})
+    bot_db_id = bot_record.get('id')
+    owner_id = bot_record.get('owner_id')
     codes = []
+    over_count = 0
 
     for msg in messages:
         file_id, file_type, file_size, file_unique_id = _extract_file_info(msg)
@@ -619,10 +682,14 @@ async def _save_media_messages(messages, context) -> list:
                                    bot_db_id=bot_db_id,
                                    source_chat_id=str(msg.chat_id), source_message_id=msg.message_id)
             if code:
-                codes.append(code)
-                logger.info("媒体组文件已保存: code=%s file_type=%s user_id=%s chat_id=%s message_id=%s file_unique_id=%s",
-                            code, file_type, uid, msg.chat_id, msg.message_id, file_unique_id)
-    return codes
+                over = await is_bot_over_file_quota(bot_db_id, owner_id)
+                if over:
+                    over_count += 1
+                else:
+                    codes.append(code)
+                logger.info("媒体组文件已保存: code=%s file_type=%s user_id=%s chat_id=%s message_id=%s file_unique_id=%s over_quota=%s",
+                            code, file_type, uid, msg.chat_id, msg.message_id, file_unique_id, over)
+    return codes, over_count
 
 
 async def _get_protect_async(context, chat_id: int) -> bool:
